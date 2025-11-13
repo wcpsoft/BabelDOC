@@ -123,6 +123,9 @@ class BaseTranslator(ABC):
         :param text: text to translate
         :return: translated text
         """
+        if text is None:
+            return None
+            
         self.translate_call_count += 1
         if not (self.ignore_cache or ignore_cache):
             try:
@@ -134,8 +137,13 @@ class BaseTranslator(ABC):
                 logger.debug(f"try get cache failed, ignore it: {e}")
         _translate_rate_limiter.wait()
         translation = self.do_translate(text, rate_limit_params)
-        if not (self.ignore_cache or ignore_cache):
-            self.cache.set(text, translation)
+        if not (self.ignore_cache or ignore_cache) and translation is not None:
+            try:
+                self.cache.set(text, translation)
+            except Exception as e:
+                logger.debug(
+                    f"try set cache failed, ignore it: {e}, text: {text}, translation: {translation}"
+                )
         return translation
 
     def llm_translate(self, text, ignore_cache=False, rate_limit_params: dict = None):
@@ -144,6 +152,9 @@ class BaseTranslator(ABC):
         :param text: text to translate
         :return: translated text
         """
+        if text is None:
+            return None
+            
         self.translate_call_count += 1
         if not (self.ignore_cache or ignore_cache):
             try:
@@ -155,7 +166,7 @@ class BaseTranslator(ABC):
                 logger.debug(f"try get cache failed, ignore it: {e}")
         _translate_rate_limiter.wait()
         translation = self.do_llm_translate(text, rate_limit_params)
-        if not (self.ignore_cache or ignore_cache):
+        if not (self.ignore_cache or ignore_cache) and translation is not None:
             try:
                 self.cache.set(text, translation)
             except Exception as e:
@@ -231,7 +242,7 @@ class OpenAITranslator(BaseTranslator):
                 limits=httpx.Limits(
                     max_connections=None, max_keepalive_connections=None
                 ),
-                timeout=60,  # Set a reasonable timeout
+                timeout=180,  # Increased timeout to 180 seconds for better handling of large requests
             ),
         )
         if send_temperature:
@@ -258,18 +269,36 @@ class OpenAITranslator(BaseTranslator):
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def do_translate(self, text, rate_limit_params: dict = None) -> str:
+        if text is None:
+            return None
+            
         options = {}
         if self.send_temperature:
             options.update(self.options)
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            **options,
-            messages=self.prompt(text),
-            extra_body=self.extra_body,
-        )
-        self.update_token_count(response)
-        return response.choices[0].message.content.strip()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                **options,
+                messages=self.prompt(text),
+                extra_body=self.extra_body,
+            )
+            self.update_token_count(response)
+            
+            # Check if response has valid content
+            if not response.choices or not response.choices[0] or not response.choices[0].message:
+                logger.warning("OpenAI API returned empty response choices in do_translate")
+                return None
+                
+            content = response.choices[0].message.content
+            if content is None:
+                logger.warning("OpenAI API returned None content in do_translate")
+                return None
+                
+            return content.strip()
+        except Exception as e:
+            logger.error(f"Unexpected error in do_translate: {str(e)}")
+            return None
 
     def prompt(self, text):
         return [
@@ -321,7 +350,18 @@ class OpenAITranslator(BaseTranslator):
                 extra_body=self.extra_body,
             )
             self.update_token_count(response)
-            return response.choices[0].message.content.strip()
+            
+            # Check if response has valid content
+            if not response.choices or not response.choices[0] or not response.choices[0].message:
+                logger.warning("OpenAI API returned empty response choices")
+                return None
+                
+            content = response.choices[0].message.content
+            if content is None:
+                logger.warning("OpenAI API returned None content")
+                return None
+                
+            return content.strip()
         except openai.BadRequestError as e:
             if (
                 "系统检测到输入或生成内容可能包含不安全或敏感内容，请您避免输入易产生敏感内容的提示语，感谢您的配合。"
@@ -330,6 +370,9 @@ class OpenAITranslator(BaseTranslator):
                 raise ContentFilterError(e.message) from e
             else:
                 raise
+        except Exception as e:
+            logger.error(f"Unexpected error in do_llm_translate: {str(e)}")
+            return None
 
     def update_token_count(self, response):
         try:

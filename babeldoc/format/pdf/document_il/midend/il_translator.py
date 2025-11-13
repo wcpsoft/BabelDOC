@@ -619,7 +619,7 @@ class ILTranslator:
                 return None
 
             # 如果占位符数量超过阈值，且未禁用富文本翻译，则递归调用并禁用富文本翻译
-            if len(placeholders) > 40 and not disable_rich_text_translate:
+            if len(placeholders) > 80 and not disable_rich_text_translate:
                 logger.warning(
                     f"Too many placeholders ({len(placeholders)}) in paragraph[{paragraph.debug_id}], "
                     "disabling rich text translation for this paragraph",
@@ -1090,12 +1090,18 @@ Now, please carefully read the following text to be translated and directly outp
                             "paragraph_token_count": paragraph_token_count
                         },
                     )
-                translated_text = re.sub(r"[. 。…，]{20,}", ".", translated_text)
+                translated_text = re.sub(r"[. 。…，]{20,}", ".", translated_text) if translated_text is not None else None
+                
+                # Check if translated_text is None or empty after translation
+                if translated_text is None or not translated_text.strip():
+                    logger.warning(f"Translation returned None or empty for paragraph {paragraph.debug_id}. Using original text.")
+                    translated_text = text  # Fallback to original text
 
                 # Post-translation processing
-                self.post_translate_paragraph(
-                    paragraph, tracker, translate_input, translated_text
-                )
+                if translated_text is not None:
+                    self.post_translate_paragraph(
+                        paragraph, tracker, translate_input, translated_text
+                    )
             except ContentFilterError as e:
                 logger.warning(f"ContentFilterError: {e.message}")
                 self.add_content_filter_hint(page, paragraph)

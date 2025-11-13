@@ -782,20 +782,70 @@ class ILTranslatorLLMOnly:
 
             for llm_translate_tracker in llm_translate_trackers:
                 llm_translate_tracker.set_input(final_input)
-            llm_output = self.translate_engine.llm_translate(
-                final_input,
-                rate_limit_params={
-                    "paragraph_token_count": paragraph_token_count,
-                    "request_json_mode": True,
-                },
-            )
+            
+            # Add retry mechanism for timeout errors
+            max_retries = 3
+            retry_delay = 2  # seconds
+            llm_output = None
+            
+            for attempt in range(max_retries):
+                try:
+                    llm_output = self.translate_engine.llm_translate(
+                        final_input,
+                        rate_limit_params={
+                            "paragraph_token_count": paragraph_token_count,
+                            "request_json_mode": True,
+                        },
+                    )
+                    # If successful, break out of retry loop
+                    break
+                except Exception as e:
+                    if "timed out" in str(e).lower() and attempt < max_retries - 1:
+                        logger.warning(f"Translation attempt {attempt + 1} timed out. Retrying in {retry_delay} seconds...")
+                        import time
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        # Re-raise the exception if it's not a timeout or we've exhausted retries
+                        raise
+            
+            # Check if llm_output is None or empty after retries
+            if llm_output is None or not llm_output.strip():
+                raise Exception("Translation failed: received empty or null output after retries")
+            
             for llm_translate_tracker in llm_translate_trackers:
                 llm_translate_tracker.set_output(llm_output)
-            llm_output = llm_output.strip()
+            
+            # Ensure llm_output is a string before calling strip()
+            if isinstance(llm_output, str):
+                llm_output = llm_output.strip()
+            else:
+                llm_output = str(llm_output).strip() if llm_output is not None else ""
 
             llm_output = self._clean_json_output(llm_output)
 
-            parsed_output = json.loads(llm_output)
+            # Try to parse JSON with error handling for incomplete JSON
+            try:
+                parsed_output = json.loads(llm_output)
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON decode error: {e}. Attempting to fix incomplete JSON.")
+                
+                # Try to fix common JSON issues
+                try:
+                    # If JSON is truncated, try to fix it
+                    if llm_output.count('{') > llm_output.count('}'):
+                        llm_output += '}' * (llm_output.count('{') - llm_output.count('}'))
+                    
+                    # If JSON has unclosed strings, try to fix them
+                    if llm_output.count('"') % 2 != 0:
+                        llm_output += '"'
+                    
+                    # Try parsing again
+                    parsed_output = json.loads(llm_output)
+                except json.JSONDecodeError as e2:
+                    logger.error(f"Failed to fix JSON: {e2}. Original error: {e}. Output: {llm_output[:200]}...")
+                    raise Exception(f"Invalid JSON output from translation: {e}")
 
             if isinstance(parsed_output, dict) and parsed_output.get(
                 "output", parsed_output.get("input", False)
