@@ -341,6 +341,51 @@ class AutomaticTermExtractor:
         # If all else fails, return an empty array
         return "[]"
 
+    def _extract_json_with_regex(self, text: str):
+        """
+        Extract JSON objects from text using regex patterns.
+        This is a last resort when standard JSON parsing fails.
+        """
+        import re
+        
+        # Try to extract all src-tgt pairs using regex
+        # This pattern looks for "src": "value" followed by "tgt": "value"
+        pattern = r'"src"\s*:\s*"([^"]*(?:\\.[^"]*)*)"\s*,\s*"tgt"\s*:\s*"([^"]*(?:\\.[^"]*)*)"'
+        matches = re.findall(pattern, text)
+        
+        if matches:
+            # Reconstruct a valid JSON array from the matches
+            items = []
+            for src, tgt in matches:
+                # Unescape the strings
+                src = src.replace('\\"', '"').replace('\\\\', '\\')
+                tgt = tgt.replace('\\"', '"').replace('\\\\', '\\')
+                items.append(f'{{"src": "{src}", "tgt": "{tgt}"}}')
+            
+            try:
+                return json.loads(f'[{",".join(items)}]')
+            except json.JSONDecodeError:
+                pass
+        
+        # If that didn't work, try a more relaxed pattern
+        pattern = r'src\s*[:=]\s*["\']([^"\']*(?:\\.[^"\']*)*)["\'].*?tgt\s*[:=]\s*["\']([^"\']*(?:\\.[^"\']*)*)["\']'
+        matches = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
+        
+        if matches:
+            items = []
+            for src, tgt in matches:
+                src = src.replace('\\"', '"').replace('\\\\', '\\')
+                tgt = tgt.replace('\\"', '"').replace('\\\\', '\\')
+                items.append(f'{{"src": "{src}", "tgt": "{tgt}"}}')
+            
+            try:
+                return json.loads(f'[{",".join(items)}]')
+            except json.JSONDecodeError:
+                pass
+        
+        # If all else fails, return an empty array
+        return []
+
     def _process_llm_response(self, llm_response_text: str, request_id: str):
         try:
             cleaned_response_text = self._clean_json_output(llm_response_text)
@@ -507,6 +552,7 @@ class AutomaticTermExtractor:
             parse_attempts = [
                 lambda: json.loads(cleaned_output),  # First attempt with cleaned output
                 lambda: json.loads(self._emergency_json_fix(cleaned_output)),  # Emergency fix
+                lambda: self._extract_json_with_regex(cleaned_output),  # New regex-based extraction
             ]
             
             last_error = None
@@ -516,6 +562,9 @@ class AutomaticTermExtractor:
                     if isinstance(response, list) or isinstance(response, dict):
                         break
                 except json.JSONDecodeError as e:
+                    last_error = e
+                    continue
+                except Exception as e:
                     last_error = e
                     continue
             

@@ -336,7 +336,19 @@ class OpenAITranslator(BaseTranslator):
                 '{"input": "disable", "output": "disable"}'
             )
         try:
-            response = self.client.chat.completions.create(
+            # Create a new client with extended timeout for this specific request
+            client_with_extended_timeout = openai.OpenAI(
+                base_url=self.client.base_url,
+                api_key=self.client.api_key,
+                http_client=httpx.Client(
+                    limits=httpx.Limits(
+                        max_connections=None, max_keepalive_connections=None
+                    ),
+                    timeout=300,  # Extended timeout to 300 seconds for large requests
+                ),
+            )
+            
+            response = client_with_extended_timeout.chat.completions.create(
                 model=self.model,
                 **options,
                 max_tokens=2048,
@@ -370,9 +382,14 @@ class OpenAITranslator(BaseTranslator):
                 raise ContentFilterError(e.message) from e
             else:
                 raise
+        except httpx.TimeoutException as e:
+            logger.error(f"Request timed out in do_llm_translate: {str(e)}")
+            # Return a fallback response instead of None to prevent process interruption
+            return "[]"
         except Exception as e:
             logger.error(f"Unexpected error in do_llm_translate: {str(e)}")
-            return None
+            # Return a fallback response instead of None to prevent process interruption
+            return "[]"
 
     def update_token_count(self, response):
         try:
