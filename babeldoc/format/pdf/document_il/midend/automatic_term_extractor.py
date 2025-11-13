@@ -158,29 +158,224 @@ class AutomaticTermExtractor:
         return total_tokens, prompt_tokens, completion_tokens, cache_hit_prompt_tokens
 
     def _clean_json_output(self, llm_output: str) -> str:
+        """
+        Clean and fix common JSON formatting issues in LLM output.
+        
+        This method handles various common issues with LLM-generated JSON:
+        1. Removes markdown code blocks (```json, ```)
+        2. Removes XML-like tags (<json>, </json>)
+        3. Fixes unterminated strings
+        4. Fixes missing quotes around property names
+        5. Handles trailing commas
+        6. Attempts to recover from other formatting issues
+        """
+        if not llm_output:
+            return "[]"
+            
         llm_output = llm_output.strip()
-        if llm_output.startswith("<json>"):
-            llm_output = llm_output[6:]
-        if llm_output.endswith("</json>"):
-            llm_output = llm_output[:-7]
+        
+        # Remove markdown code blocks
         if llm_output.startswith("```json"):
             llm_output = llm_output[7:]
         if llm_output.startswith("```"):
             llm_output = llm_output[3:]
         if llm_output.endswith("```"):
             llm_output = llm_output[:-3]
-        return llm_output.strip()
+            
+        # Remove XML-like tags
+        if llm_output.startswith("<json>"):
+            llm_output = llm_output[6:]
+        if llm_output.endswith("</json>"):
+            llm_output = llm_output[:-7]
+            
+        llm_output = llm_output.strip()
+        
+        # Enhanced unterminated string fix
+        import re
+        
+        # First, let's identify and fix unterminated strings more carefully
+        # We'll use a more robust approach that tracks string boundaries
+        result = []
+        in_string = False
+        escape_next = False
+        i = 0
+        n = len(llm_output)
+        
+        while i < n:
+            char = llm_output[i]
+            
+            if escape_next:
+                # Just add the escaped character and continue
+                result.append(char)
+                escape_next = False
+                i += 1
+                continue
+                
+            if char == '\\':
+                # Mark next character as escaped
+                result.append(char)
+                escape_next = True
+                i += 1
+                continue
+                
+            if char == '"':
+                # Toggle string state
+                in_string = not in_string
+                result.append(char)
+                i += 1
+                continue
+                
+            # If we're at the end of the string and still in a string state,
+            # we need to close it
+            if i == n - 1 and in_string:
+                result.append('"')
+                in_string = False
+                i += 1
+                continue
+                
+            # Regular character
+            result.append(char)
+            i += 1
+        
+        llm_output = ''.join(result)
+        
+        # Additional fix for specific patterns that cause unterminated strings
+        # Pattern 1: Fix strings that end with backslash without proper escaping
+        llm_output = re.sub(r'([^\\])\\([^"\\n\r])', r'\1\\\\\2', llm_output)
+        
+        # Pattern 2: Fix strings that have unescaped newlines
+        llm_output = re.sub(r'([^\\])\n', r'\1\\n', llm_output)
+        
+        # Fix missing quotes around property names
+        # This regex finds property names without quotes in JSON objects
+        pattern = r'((?:^|\{|\,)\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:'
+        llm_output = re.sub(pattern, r'\1"\2":', llm_output)
+        
+        # Remove trailing commas before closing brackets/braces
+        llm_output = re.sub(r',(\s*[}\]])', r'\1', llm_output)
+        
+        # Ensure the output is a valid JSON array
+        llm_output = llm_output.strip()
+        if not llm_output.startswith('['):
+            if llm_output.startswith('{'):
+                # It's a single object, wrap it in an array
+                llm_output = f'[{llm_output}]'
+            else:
+                # Try to extract JSON objects from the text
+                json_objects = re.findall(r'\{[^{}]*\}', llm_output)
+                if json_objects:
+                    llm_output = f'[{",".join(json_objects)}]'
+                else:
+                    # Fallback to empty array
+                    llm_output = '[]'
+        
+        return llm_output
+
+    def _emergency_json_fix(self, json_str: str) -> str:
+        """
+        Emergency fix for severely malformed JSON strings.
+        This is a last resort attempt to extract some usable data.
+        """
+        import re
+        
+        # First, try to fix common structural issues
+        json_str = json_str.strip()
+        
+        # Fix missing quotes around property names
+        json_str = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', json_str)
+        
+        # Fix missing quotes around string values
+        json_str = re.sub(r':\s*([a-zA-Z_][a-zA-Z0-9_]*)(\s*[,}])', r': "\1"\2', json_str)
+        
+        # Fix trailing commas
+        json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+        
+        # Try to extract all src-tgt pairs using regex
+        # This pattern looks for "src": "value" followed by "tgt": "value"
+        pattern = r'"src"\s*:\s*"([^"]*(?:\\.[^"]*)*)"\s*,\s*"tgt"\s*:\s*"([^"]*(?:\\.[^"]*)*)"'
+        matches = re.findall(pattern, json_str)
+        
+        if matches:
+            # Reconstruct a valid JSON array from the matches
+            items = []
+            for src, tgt in matches:
+                # Unescape the strings
+                src = src.replace('\\"', '"').replace('\\\\', '\\')
+                tgt = tgt.replace('\\"', '"').replace('\\\\', '\\')
+                items.append(f'{{"src": "{src}", "tgt": "{tgt}"}}')
+            
+            return f'[{",".join(items)}]'
+        
+        # If that didn't work, try a more relaxed pattern
+        pattern = r'src\s*[:=]\s*["\']([^"\']*(?:\\.[^"\']*)*)["\'].*?tgt\s*[:=]\s*["\']([^"\']*(?:\\.[^"\']*)*)["\']'
+        matches = re.findall(pattern, json_str, re.IGNORECASE | re.DOTALL)
+        
+        if matches:
+            items = []
+            for src, tgt in matches:
+                src = src.replace('\\"', '"').replace('\\\\', '\\')
+                tgt = tgt.replace('\\"', '"').replace('\\\\', '\\')
+                items.append(f'{{"src": "{src}", "tgt": "{tgt}"}}')
+            
+            return f'[{",".join(items)}]'
+        
+        # Try to extract any objects that might contain src and tgt
+        # This handles cases where the structure is broken but the data is there
+        objects = re.findall(r'\{[^{}]*src[^{}]*tgt[^{}]*\}', json_str, re.IGNORECASE)
+        
+        if objects:
+            items = []
+            for obj in objects:
+                # Try to extract src and tgt from this object
+                src_match = re.search(r'src\s*[:=]\s*["\']([^"\']*)["\']', obj, re.IGNORECASE)
+                tgt_match = re.search(r'tgt\s*[:=]\s*["\']([^"\']*)["\']', obj, re.IGNORECASE)
+                
+                if src_match and tgt_match:
+                    src = src_match.group(1).replace('\\"', '"').replace('\\\\', '\\')
+                    tgt = tgt_match.group(1).replace('\\"', '"').replace('\\\\', '\\')
+                    items.append(f'{{"src": "{src}", "tgt": "{tgt}"}}')
+            
+            if items:
+                return f'[{",".join(items)}]'
+        
+        # If all else fails, return an empty array
+        return "[]"
 
     def _process_llm_response(self, llm_response_text: str, request_id: str):
         try:
             cleaned_response_text = self._clean_json_output(llm_response_text)
-            extracted_data = json.loads(cleaned_response_text)
-
-            if not isinstance(extracted_data, list):
-                logger.warning(
-                    f"Request ID {request_id}: LLM response was not a JSON list, but type: {type(extracted_data)}. Content: {cleaned_response_text[:200]}"
+            
+            # Try to parse with multiple fallback attempts
+            extracted_data = None
+            parse_attempts = [
+                lambda: json.loads(cleaned_response_text),  # First attempt with cleaned output
+                lambda: json.loads(self._emergency_json_fix(cleaned_response_text)),  # Emergency fix
+            ]
+            
+            for attempt in parse_attempts:
+                try:
+                    extracted_data = attempt()
+                    if isinstance(extracted_data, list) or isinstance(extracted_data, dict):
+                        break
+                except json.JSONDecodeError:
+                    continue
+            
+            # If all attempts failed, log and return
+            if extracted_data is None:
+                logger.error(
+                    f"Request ID {request_id}: Failed to parse JSON after multiple attempts. Response: {llm_response_text[:200]}..."
                 )
                 return
+
+            # Ensure we have a list
+            if not isinstance(extracted_data, list):
+                if isinstance(extracted_data, dict):
+                    extracted_data = [extracted_data]
+                else:
+                    logger.warning(
+                        f"Request ID {request_id}: Unexpected response type: {type(extracted_data)}. Expected list or dict."
+                    )
+                    return
 
             for item in extracted_data:
                 if isinstance(item, dict) and "src" in item and "tgt" in item:
@@ -197,10 +392,6 @@ class AutomaticTermExtractor:
                         f"Request ID {request_id}: Skipping malformed item in LLM JSON response: {item}"
                     )
 
-        except json.JSONDecodeError as e:
-            logger.error(
-                f"Request ID {request_id}: JSON Parsing Error: {e}. Problematic LLM Response after cleaning (start): {cleaned_response_text[:200]}..."
-            )
         except Exception as e:
             logger.error(f"Request ID {request_id}: Error processing LLM response: {e}")
 
@@ -310,9 +501,48 @@ class AutomaticTermExtractor:
             )
             tracker.set_output(output)
             cleaned_output = self._clean_json_output(output)
-            response = json.loads(cleaned_output)
+            
+            # Try to parse the JSON with multiple fallback attempts
+            response = None
+            parse_attempts = [
+                lambda: json.loads(cleaned_output),  # First attempt with cleaned output
+                lambda: json.loads(self._emergency_json_fix(cleaned_output)),  # Emergency fix
+            ]
+            
+            last_error = None
+            for attempt in parse_attempts:
+                try:
+                    response = attempt()
+                    if isinstance(response, list) or isinstance(response, dict):
+                        break
+                except json.JSONDecodeError as e:
+                    last_error = e
+                    continue
+            
+            # If all attempts failed, log and return
+            if response is None:
+                # Save the problematic output for debugging
+                debug_file = f"/tmp/debug_json_error_{hash(output) % 10000}.txt"
+                try:
+                    with open(debug_file, 'w', encoding='utf-8') as f:
+                        f.write(f"Original Output:\n{output}\n\n")
+                        f.write(f"Cleaned Output:\n{cleaned_output}\n\n")
+                        if last_error:
+                            f.write(f"Error: {last_error}\n")
+                    logger.error(f"Failed to parse JSON response after multiple attempts. Debug info saved to {debug_file}")
+                except Exception as debug_e:
+                    logger.error(f"Failed to parse JSON and failed to save debug info: {debug_e}")
+                
+                logger.error(f"Failed to parse JSON response after multiple attempts. Output: {output[:200]}...")
+                return
+            
+            # Ensure we have a list
             if not isinstance(response, list):
-                response = [response]  # Ensure we have a list
+                if isinstance(response, dict):
+                    response = [response]
+                else:
+                    logger.warning(f"Unexpected response type: {type(response)}. Expected list or dict.")
+                    return
 
             for term in response:
                 if isinstance(term, dict) and "src" in term and "tgt" in term:
