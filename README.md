@@ -212,6 +212,7 @@ uv run babeldoc --files example.pdf --files example2.pdf --openai --openai-model
 - `--openai-base-url`: Base URL for OpenAI API
 - `--openai-api-key`: API key for OpenAI service
 - `--enable-json-mode-if-requested`: Enable JSON mode for OpenAI requests (default: False)
+- `--term-pool-max-workers`: Maximum number of worker threads dedicated to automatic term extraction. If not specified, this defaults to the value of `--pool-max-workers`, which itself defaults to the QPS value when unset.
 
 > [!TIP]
 >

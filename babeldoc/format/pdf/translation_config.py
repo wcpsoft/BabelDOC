@@ -138,6 +138,8 @@ class TranslationConfig:
     def create_max_pages_per_part_split_strategy(max_pages_per_part: int):
         return PageCountStrategy(max_pages_per_part)
 
+    # for backward compatibility,
+    # new parameters should be added at the end of the function.
     def __init__(
         self,
         translator: BaseTranslator,
@@ -196,6 +198,7 @@ class TranslationConfig:
         skip_formula_offset_calculation: bool = False,
         term_extraction_translator: BaseTranslator | None = None,
         metadata_extra_data: str | None = None,
+        term_pool_max_workers: int | None = None,
     ):
         self.translator = translator
         self.term_extraction_translator = term_extraction_translator or translator
@@ -223,6 +226,13 @@ class TranslationConfig:
         # Set pool_max_workers with default value from qps
         self.pool_max_workers = (
             pool_max_workers if pool_max_workers is not None else qps
+        )
+        # Set term_pool_max_workers for automatic term extraction.
+        # If not provided, default to pool_max_workers.
+        self.term_pool_max_workers = (
+            term_pool_max_workers
+            if term_pool_max_workers is not None
+            else self.pool_max_workers
         )
         self.split_short_lines = split_short_lines
 

@@ -26,7 +26,7 @@ from babeldoc.translator.translator import OpenAITranslator
 from babeldoc.translator.translator import set_translate_rate_limiter
 
 logger = logging.getLogger(__name__)
-__version__ = "0.5.17"
+__version__ = "0.5.18"
 
 
 def create_parser():
@@ -279,6 +279,11 @@ def create_parser():
         "--pool-max-workers",
         type=int,
         help="Maximum number of worker threads for internal task processing pools. If not specified, defaults to QPS value. This parameter directly sets the worker count, replacing previous QPS-based dynamic calculations.",
+    )
+    translation_group.add_argument(
+        "--term-pool-max-workers",
+        type=int,
+        help="Maximum number of worker threads dedicated to automatic term extraction. If not specified, defaults to --pool-max-workers (or QPS value when unset).",
     )
     translation_group.add_argument(
         "--no-auto-extract-glossary",
@@ -694,6 +699,7 @@ async def main():
             figure_table_protection_threshold=args.figure_table_protection_threshold,
             skip_formula_offset_calculation=args.skip_formula_offset_calculation,
             metadata_extra_data=args.metadata_extra_data,
+            term_pool_max_workers=args.term_pool_max_workers,
         )
 
         def nop(_x):

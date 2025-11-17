@@ -621,8 +621,12 @@ class AutomaticTermExtractor:
             self.stage_name,
             total,
         ) as pbar:
+            max_workers = self.translation_config.term_pool_max_workers
+            logger.info(
+                f"Using {max_workers} worker threads for automatic term extraction."
+            )
             with PriorityThreadPoolExecutor(
-                max_workers=self.translation_config.pool_max_workers,
+                max_workers=max_workers,
             ) as executor:
                 for page in doc_il.page:
                     self.process_page(page, executor, pbar, tracker.new_page())
