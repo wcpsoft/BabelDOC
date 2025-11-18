@@ -226,6 +226,7 @@ class OpenAITranslator(BaseTranslator):
         enable_json_mode_if_requested=False,
         send_dashscope_header=False,
         send_temperature=True,
+        reasoning=None,
     ):
         super().__init__(lang_in, lang_out, ignore_cache)
         self.options = {"temperature": 0}  # 随机采样可能会打断公式标记
@@ -235,6 +236,7 @@ class OpenAITranslator(BaseTranslator):
         #         "effort": "minimal"
         #     }
         #     self.add_cache_impact_parameters("reasoning-effort", 'minimal')
+        self.reasoning = reasoning
         self.client = openai.OpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -253,6 +255,9 @@ class OpenAITranslator(BaseTranslator):
         self.send_temperature = send_temperature
         self.add_cache_impact_parameters("model", self.model)
         self.add_cache_impact_parameters("prompt", self.prompt(""))
+        if self.reasoning:
+            self.extra_body["reasoning"] = {"effort": self.reasoning}
+            self.add_cache_impact_parameters("reasoning", self.reasoning)
         if self.enable_json_mode_if_requested:
             self.add_cache_impact_parameters(
                 "enable_json_mode_if_requested", self.enable_json_mode_if_requested

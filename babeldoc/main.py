@@ -436,6 +436,18 @@ def create_parser():
         default=False,
         help="Do not send temperature parameter to OpenAI API (default: send temperature).",
     )
+    service_group.add_argument(
+        "--openai-reasoning",
+        type=str,
+        default=None,
+        help="Reasoning string to send in the OpenAI request body 'reasoning' field. If not set, the field is not sent.",
+    )
+    service_group.add_argument(
+        "--openai-term-extraction-reasoning",
+        type=str,
+        default=None,
+        help="Reasoning string for the OpenAI term extraction translator. If not set, no reasoning field is sent for term extraction requests.",
+    )
 
     return parser
 
@@ -479,6 +491,9 @@ async def main():
 
     # 实例化翻译器
     if args.openai:
+        translator_kwargs: dict[str, Any] = {}
+        if args.openai_reasoning is not None:
+            translator_kwargs["reasoning"] = args.openai_reasoning
         translator = OpenAITranslator(
             lang_in=args.lang_in,
             lang_out=args.lang_out,
@@ -489,6 +504,7 @@ async def main():
             enable_json_mode_if_requested=args.enable_json_mode_if_requested,
             send_dashscope_header=args.send_dashscope_header,
             send_temperature=not args.no_send_temperature,
+            **translator_kwargs,
         )
         term_extraction_translator = translator
         if (
@@ -496,6 +512,11 @@ async def main():
             or args.openai_term_extraction_base_url
             or args.openai_term_extraction_api_key
         ):
+            term_translator_kwargs: dict[str, Any] = {}
+            if args.openai_term_extraction_reasoning is not None:
+                term_translator_kwargs["reasoning"] = (
+                    args.openai_term_extraction_reasoning
+                )
             term_extraction_translator = OpenAITranslator(
                 lang_in=args.lang_in,
                 lang_out=args.lang_out,
@@ -506,6 +527,7 @@ async def main():
                 enable_json_mode_if_requested=args.enable_json_mode_if_requested,
                 send_dashscope_header=args.send_dashscope_header,
                 send_temperature=not args.no_send_temperature,
+                **term_translator_kwargs,
             )
     else:
         raise ValueError("Invalid translator type")

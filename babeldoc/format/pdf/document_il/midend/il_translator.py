@@ -351,7 +351,10 @@ class ILTranslator:
 
         path = self.translation_config.get_working_file_path("translate_tracking.json")
 
-        if self.translation_config.debug:
+        if (
+            self.translation_config.debug
+            or self.translation_config.working_dir is not None
+        ):
             logger.debug(f"save translate tracking to {path}")
             with Path(path).open("w", encoding="utf-8") as f:
                 f.write(tracker.to_json())

@@ -642,7 +642,10 @@ class AutomaticTermExtractor:
             end_cache_hit_prompt - start_cache_hit_prompt,
         )
 
-        if self.translation_config.debug:
+        if (
+            self.translation_config.debug
+            or self.translation_config.working_dir is not None
+        ):
             path = self.translation_config.get_working_file_path(
                 "term_extractor_tracking.json"
             )
