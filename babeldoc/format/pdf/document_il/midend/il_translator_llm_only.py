@@ -38,8 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 PROMPT_TEMPLATE = Template(
-    """#role
-$role_block
+    """$role_block
 
 ## Structure Rules
 1. Keep **the same number of paragraphs as the input**.
@@ -934,7 +933,7 @@ class ILTranslatorLLMOnly:
                 role_block += "Follow all rules strictly."
         else:
             role_block = (
-                f"You are a deterministic translation engine converting the input text "
+                f"You are a professional {self.translation_config.lang_out} native translator who needs to fluently translate text "
                 f"into {self.translation_config.lang_out}.\n\n"
                 "Follow all rules strictly."
             )
