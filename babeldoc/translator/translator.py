@@ -201,13 +201,13 @@ class BaseTranslator(ABC):
     def __str__(self):
         return f"{self.name} {self.lang_in} {self.lang_out} {self.model}"
 
-    def get_rich_text_left_placeholder(self, placeholder_id: int):
+    def get_rich_text_left_placeholder(self, placeholder_id: int | str):
         return f"<b{placeholder_id}>"
 
-    def get_rich_text_right_placeholder(self, placeholder_id: int):
+    def get_rich_text_right_placeholder(self, placeholder_id: int | str):
         return f"</b{placeholder_id}>"
 
-    def get_formular_placeholder(self, placeholder_id: int):
+    def get_formular_placeholder(self, placeholder_id: int | str):
         return self.get_rich_text_left_placeholder(placeholder_id)
 
 
@@ -411,15 +411,15 @@ class OpenAITranslator(BaseTranslator):
         except Exception as e:
             logger.exception("Error updating token count")
 
-    def get_formular_placeholder(self, placeholder_id: int):
+    def get_formular_placeholder(self, placeholder_id: int | str):
         return "{v" + str(placeholder_id) + "}", f"{{\\s*v\\s*{placeholder_id}\\s*}}"
         return "{{" + str(placeholder_id) + "}}"
 
-    def get_rich_text_left_placeholder(self, placeholder_id: int):
+    def get_rich_text_left_placeholder(self, placeholder_id: int | str):
         return (
             f"<style id='{placeholder_id}'>",
             f"<\\s*style\\s*id\\s*=\\s*'\\s*{placeholder_id}\\s*'\\s*>",
         )
 
-    def get_rich_text_right_placeholder(self, placeholder_id: int):
+    def get_rich_text_right_placeholder(self, placeholder_id: int | str):
         return "</style>", r"<\s*\/\s*style\s*>"

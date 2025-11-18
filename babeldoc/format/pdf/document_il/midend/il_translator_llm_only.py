@@ -84,9 +84,9 @@ Output:
 
 $contextual_hints_block
 
-## Here is the input:
-
 $glossary_tables_block
+
+## Here is the input:
 
 $json_input_str"""
 )
@@ -812,6 +812,7 @@ class ILTranslatorLLMOnly:
                         llm_translate_tracker.set_error_message(
                             "Translation result is the same as input, fallback."
                         )
+                        llm_translate_tracker.set_placeholder_full_match()
                         logger.warning(
                             "Translation result is the same as input, fallback."
                         )
@@ -824,6 +825,7 @@ class ILTranslatorLLMOnly:
                         logger.warning(
                             f"Translation result is too long or too short. Input: {input_token_count}, Output: {output_token_count}"
                         )
+                        llm_translate_tracker.set_placeholder_full_match()
                         continue
 
                     edit_distance = Levenshtein.distance(input_unicode, output_unicode)
@@ -834,6 +836,7 @@ class ILTranslatorLLMOnly:
                         logger.warning(
                             f"Translation result edit distance is too small. distance: {edit_distance}, input: {input_unicode}, output: {output_unicode}"
                         )
+                        llm_translate_tracker.set_placeholder_full_match()
                         continue
                     # Apply the translation to the paragraph
                     self.il_translator.post_translate_paragraph(

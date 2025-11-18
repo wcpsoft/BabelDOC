@@ -195,6 +195,12 @@ class DocumentTranslateTracker:
             pdf_unicode = getattr(para, "pdf_unicode", None)
             llm_translate_trackers = getattr(para, "llm_translate_trackers", None)
             placeholders = getattr(para, "placeholders", None)
+            original_placeholders = getattr(para, "original_placeholders", None)
+            removed_hallucinated_placeholders = getattr(
+                para,
+                "removed_hallucinated_placeholders",
+                None,
+            )
 
             llm_translate_trackers_json = []
             if llm_translate_trackers:
@@ -216,6 +222,8 @@ class DocumentTranslateTracker:
                 "placeholders": placeholders_json,
                 "multi_paragraph_id": getattr(para, "multi_paragraph_id", None),
                 "multi_paragraph_index": getattr(para, "multi_paragraph_index", None),
+                "original_placeholders": original_placeholders,
+                "removed_hallucinated_placeholders": removed_hallucinated_placeholders,
             }
             paragraphs.append(
                 paragraph_json,
@@ -236,6 +244,8 @@ class PageTranslateTracker:
 class ParagraphTranslateTracker:
     def __init__(self):
         self.llm_translate_trackers = []
+        self.original_placeholders: dict[str, int] = {}
+        self.removed_hallucinated_placeholders: dict[str, int] = {}
 
     def set_pdf_unicode(self, unicode: str):
         self.pdf_unicode = unicode
@@ -248,6 +258,10 @@ class ParagraphTranslateTracker:
     ):
         self.placeholders = placeholders
 
+    def set_original_placeholders(self, placeholders: dict[str, int] | None):
+        """Record original placeholder-like tokens from the source text."""
+        self.original_placeholders = placeholders or {}
+
     def record_multi_paragraph_id(self, mid):
         self.multi_paragraph_id = mid
 
@@ -256,6 +270,14 @@ class ParagraphTranslateTracker:
 
     def set_output(self, output: str):
         self.output = output
+
+    def record_removed_hallucinated_placeholder(self, token: str):
+        """Record placeholder-like tokens removed from translated text."""
+        if not token:
+            return
+        self.removed_hallucinated_placeholders[token] = (
+            self.removed_hallucinated_placeholders.get(token, 0) + 1
+        )
 
     def new_llm_translate_tracker(self) -> LLMTranslateTracker:
         tracker = LLMTranslateTracker()
@@ -342,6 +364,20 @@ class ILTranslator:
         self.use_as_fallback = False
         self.add_content_filter_hint_lock = threading.Lock()
         self.docs = None
+
+        # Pre-compile patterns for placeholder-like tokens that may be hallucinated by LLM.
+        # We only consider the same shapes as our own formula & rich-text placeholders.
+        self._formula_placeholder_pattern = re.compile(
+            self.translate_engine.get_formular_placeholder(r"\d+")[1], re.IGNORECASE
+        )
+        self._style_left_placeholder_pattern = re.compile(
+            self.translate_engine.get_rich_text_left_placeholder(r"\d+")[1],
+            re.IGNORECASE,
+        )
+        self._style_right_placeholder_pattern = re.compile(
+            self.translate_engine.get_rich_text_right_placeholder(r"\d+")[1],
+            re.IGNORECASE,
+        )
 
     def calc_token_count(self, text: str) -> int:
         try:
@@ -450,6 +486,13 @@ class ILTranslator:
             self.unicode = unicode
             self.placeholders = placeholders
             self.base_style = base_style
+            # Original placeholder-like tokens extracted from the source text.
+            # Key: exact matched token string; Value: occurrence count.
+            self.original_placeholder_tokens: dict[str, int] = {}
+
+        def set_original_placeholder_tokens(self, tokens: dict[str, int] | None):
+            """Attach original placeholder-like tokens from source text."""
+            self.original_placeholder_tokens = tokens or {}
 
         def get_placeholders_hint(self) -> dict[str, str] | None:
             hint = {}
@@ -541,6 +584,22 @@ class ILTranslator:
         # Skip paragraphs with only placeholders
         if is_placeholder_only_paragraph(paragraph):
             return None
+
+        # Extract original placeholder-like tokens from the raw paragraph text
+        original_placeholder_tokens: dict[str, int] = {}
+
+        def scan_placeholder_tokens(text: str, tokens: dict[str, int]):
+            for pattern in (
+                self._formula_placeholder_pattern,
+                self._style_left_placeholder_pattern,
+                self._style_right_placeholder_pattern,
+            ):
+                for match in pattern.finditer(text):
+                    token = match.group(0)
+                    tokens[token] = tokens.get(token, 0) + 1
+
+        if paragraph.unicode:
+            scan_placeholder_tokens(paragraph.unicode, original_placeholder_tokens)
         if len(paragraph.pdf_paragraph_composition) == 1:
             # 如果整个段落只有一个组成部分，那么直接返回，不需要套占位符等
             composition = paragraph.pdf_paragraph_composition[0]
@@ -549,7 +608,15 @@ class ILTranslator:
                 or composition.pdf_same_style_characters
                 or composition.pdf_character
             ):
-                return self.TranslateInput(paragraph.unicode, [], paragraph.pdf_style)
+                translate_input = self.TranslateInput(
+                    paragraph.unicode,
+                    [],
+                    paragraph.pdf_style,
+                )
+                translate_input.set_original_placeholder_tokens(
+                    original_placeholder_tokens,
+                )
+                return translate_input
             elif composition.pdf_formula:
                 # 不需要翻译纯公式
                 return None
@@ -658,7 +725,9 @@ class ILTranslator:
                 return self.get_translate_input(paragraph, page_font_map, True)
 
         text = get_char_unicode_string(chars)
-        return self.TranslateInput(text, placeholders, paragraph.pdf_style)
+        translate_input = self.TranslateInput(text, placeholders, paragraph.pdf_style)
+        translate_input.set_original_placeholder_tokens(original_placeholder_tokens)
+        return translate_input
 
     def process_formula(
         self,
@@ -699,6 +768,7 @@ class ILTranslator:
         self,
         input_text: TranslateInput,
         output: str,
+        tracker: ParagraphTranslateTracker | None = None,
         llm_translate_tracker: LLMTranslateTracker | None = None,
     ) -> [PdfParagraphComposition]:
         result = []
@@ -746,9 +816,42 @@ class ILTranslator:
         # 合并所有模式
         combined_pattern = "|".join(patterns)
         combined_placeholder_pattern = "|".join(placeholder_patterns)
+        # Build allowed placeholder tokens: originals from source + placeholders we injected.
+        allowed_placeholder_tokens: set[str] = set()
+        if getattr(input_text, "original_placeholder_tokens", None):
+            allowed_placeholder_tokens.update(input_text.original_placeholder_tokens)
+        for placeholder in input_text.placeholders:
+            if isinstance(placeholder, FormulaPlaceholder):
+                allowed_placeholder_tokens.add(placeholder.placeholder)
+            else:
+                allowed_placeholder_tokens.add(placeholder.left_placeholder)
+                allowed_placeholder_tokens.add(placeholder.right_placeholder)
 
         def remove_placeholder(text: str):
-            return re.sub(combined_placeholder_pattern, "", text, flags=re.IGNORECASE)
+            """Remove placeholder artifacts and hallucinated placeholder-like tokens."""
+            # First, remove any leftover placeholders built from our own regex patterns.
+            if combined_placeholder_pattern:
+                text = re.sub(
+                    combined_placeholder_pattern,
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+
+            # Then, detect placeholder-like tokens of the same shapes as our own
+            # formula and rich-text placeholders. Only keep those in the allowed set.
+            def _replace_token(match: re.Match) -> str:
+                token = match.group(0)
+                if token in allowed_placeholder_tokens:
+                    return token
+                if tracker is not None:
+                    tracker.record_removed_hallucinated_placeholder(token)
+                return ""
+
+            text = self._formula_placeholder_pattern.sub(_replace_token, text)
+            text = self._style_left_placeholder_pattern.sub(_replace_token, text)
+            text = self._style_right_placeholder_pattern.sub(_replace_token, text)
+            return text
 
         # 找到所有匹配
         last_end = 0
@@ -870,6 +973,9 @@ class ILTranslator:
             return None, None
         tracker.set_input(translate_input.unicode)
         tracker.set_placeholders(translate_input.placeholders)
+        tracker.set_original_placeholders(
+            getattr(translate_input, "original_placeholder_tokens", None),
+        )
         text = translate_input.unicode
         if len(text) < self.translation_config.min_text_length:
             logger.debug(
@@ -895,6 +1001,7 @@ class ILTranslator:
         paragraph.pdf_paragraph_composition = self.parse_translate_output(
             translate_input,
             translated_text,
+            tracker,
             tracker.last_llm_translate_tracker(),
         )
         for composition in paragraph.pdf_paragraph_composition:
