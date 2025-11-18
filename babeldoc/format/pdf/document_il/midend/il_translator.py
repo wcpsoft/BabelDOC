@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 from pathlib import Path
+from string import Template
 
 import tiktoken
 from tqdm import tqdm
@@ -44,6 +45,33 @@ from babeldoc.translator.translator import BaseTranslator
 from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
+
+
+PROMPT_TEMPLATE = Template(
+    """$role_block
+
+## Rules
+
+1. Keep the structure exactly unchanged: do NOT add/remove/reorder any tags, placeholders, or tokens.
+2. Keep all tags unchanged (e.g., <style>, <b>, </style>).
+   - Translate human-readable text inside tags.
+   - Do NOT translate text inside <code>…</code>.
+3. Do NOT translate or alter placeholders: {v1}, {name}, %s, %d, [[...]], %%...%%.
+4. If the entire input is pure code/identifiers, return it unchanged.
+5. Translate ALL human-readable content into $lang_out.
+
+$glossary_block
+
+$context_block
+
+## Output
+
+Output ONLY the translated $lang_out text. No explanations, no backticks, no extra text.
+
+Now translate the following text:
+
+$text_to_translate"""
+)
 
 
 class RichTextPlaceholder:
@@ -879,6 +907,119 @@ class ILTranslator:
                 )
         return True
 
+    def _build_role_block(self) -> str:
+        """Build the role block for LLM prompt.
+
+        Returns:
+            Role block string with custom_system_prompt or default role description.
+        """
+        custom_prompt = getattr(self.translation_config, "custom_system_prompt", None)
+        if custom_prompt:
+            role_block = custom_prompt.strip()
+            if "Follow all rules strictly." not in role_block:
+                if not role_block.endswith("\n"):
+                    role_block += "\n"
+                role_block += "Follow all rules strictly."
+        else:
+            role_block = (
+                f"You are a deterministic translation engine converting the input text "
+                f"into {self.translation_config.lang_out}.\n\n"
+                "Follow all rules strictly."
+            )
+        return role_block
+
+    def _build_context_block(
+        self,
+        title_paragraph: PdfParagraph | None = None,
+        local_title_paragraph: PdfParagraph | None = None,
+        translate_input: TranslateInput | None = None,
+    ) -> str:
+        """Build the context/hints block for LLM prompt.
+
+        Args:
+            title_paragraph: First title paragraph in the document
+            local_title_paragraph: Most recent title paragraph
+            translate_input: TranslateInput containing placeholder hints
+
+        Returns:
+            Context block string, empty if no context hints available
+        """
+        context_lines: list[str] = []
+        hint_idx = 1
+
+        if title_paragraph:
+            context_lines.append(
+                f"{hint_idx}. First title in the full text: {title_paragraph.unicode}"
+            )
+            hint_idx += 1
+
+        if local_title_paragraph:
+            is_different_from_global = True
+            if title_paragraph:
+                if local_title_paragraph.debug_id == title_paragraph.debug_id:
+                    is_different_from_global = False
+
+            if is_different_from_global:
+                context_lines.append(
+                    f"{hint_idx}. The most recent title is: {local_title_paragraph.unicode}"
+                )
+                hint_idx += 1
+
+        if translate_input and self.translation_config.add_formula_placehold_hint:
+            placeholders_hint = translate_input.get_placeholders_hint()
+            if placeholders_hint:
+                context_lines.append(
+                    f"{hint_idx}. Formula placeholder hint:\n{placeholders_hint}"
+                )
+
+        if context_lines:
+            return "## Context / Hints\n" + "\n".join(context_lines) + "\n"
+        return ""
+
+    def _build_glossary_block(self, text: str) -> str:
+        """Build the glossary block for LLM prompt.
+
+        Args:
+            text: Text to match against glossary entries
+
+        Returns:
+            Glossary block string with tables, empty if no active glossary entries
+        """
+        if not self._cached_glossaries:
+            return ""
+
+        glossary_entries_per_glossary: dict[str, list[tuple[str, str]]] = {}
+
+        for glossary in self._cached_glossaries:
+            active_entries = glossary.get_active_entries_for_text(text)
+            if active_entries:
+                glossary_entries_per_glossary[glossary.name] = sorted(active_entries)
+
+        if not glossary_entries_per_glossary:
+            return ""
+
+        glossary_block_lines: list[str] = [
+            "## Glossary",
+            "",
+            "Always use the glossary's **Target Term** for any occurrence of its **Source Term** "
+            "(including variants, inside tags, or broken across lines).",
+            "",
+            "Unlisted terms are translated naturally.",
+            "",
+        ]
+
+        for glossary_name, entries in glossary_entries_per_glossary.items():
+            glossary_block_lines.append(f"### Glossary: {glossary_name}")
+            glossary_block_lines.append("")
+            glossary_block_lines.append(
+                "| Source Term | Target Term |\n|-------------|-------------|"
+            )
+            for original_source, target_text in entries:
+                glossary_block_lines.append(f"| {original_source} | {target_text} |")
+            glossary_block_lines.append("")
+
+        return "\n".join(glossary_block_lines)
+
     def generate_prompt_for_llm(
         self,
         text: str,
@@ -886,115 +1027,30 @@ class ILTranslator:
         local_title_paragraph: PdfParagraph | None = None,
         translate_input: TranslateInput | None = None,
     ):
-        if self.translation_config.custom_system_prompt:
-            llm_input = [self.translation_config.custom_system_prompt]
-        else:
-            llm_input = [
-                f"You are a professional and reliable machine translation engine responsible for translating the input text into {self.translation_config.lang_out}."
-            ]
+        """Generate LLM prompt using template-based approach.
 
-        llm_input.append("When translating, please follow the following rules:")
+        Args:
+            text: Text to be translated
+            title_paragraph: First title paragraph in the document
+            local_title_paragraph: Most recent title paragraph
+            translate_input: TranslateInput containing placeholder information
 
-        rich_text_left_placeholder = (
-            self.translate_engine.get_rich_text_left_placeholder(1)
+        Returns:
+            Final LLM prompt string
+        """
+        role_block = self._build_role_block()
+        context_block = self._build_context_block(
+            title_paragraph, local_title_paragraph, translate_input
         )
-        if isinstance(rich_text_left_placeholder, tuple):
-            rich_text_left_placeholder = rich_text_left_placeholder[0]
-        rich_text_right_placeholder = (
-            self.translate_engine.get_rich_text_right_placeholder(2)
+        glossary_block = self._build_glossary_block(text)
+
+        return PROMPT_TEMPLATE.substitute(
+            role_block=role_block,
+            glossary_block=glossary_block,
+            context_block=context_block,
+            lang_out=self.translation_config.lang_out,
+            text_to_translate=text,
         )
-        if isinstance(rich_text_right_placeholder, tuple):
-            rich_text_right_placeholder = rich_text_right_placeholder[0]
-
-        # Create a structured prompt template for LLM translation
-        llm_input.append(
-            f'1. Do not translate style tags, such as "{rich_text_left_placeholder}xxx{rich_text_right_placeholder}"!'
-        )
-
-        formula_placeholder = self.translate_engine.get_formular_placeholder(3)
-        if isinstance(formula_placeholder, tuple):
-            formula_placeholder = formula_placeholder[0]
-
-        llm_input.append(
-            f'2. Do not translate formula placeholders, such as "{formula_placeholder}". The system will automatically replace the placeholders with the corresponding formulas.'
-        )
-        llm_input.append(
-            "3. If there is no need to translate (such as proper nouns, codes, etc.), then return the original text."
-        )
-        llm_input.append(
-            f"4. Only output the translation result in {self.translation_config.lang_out} without explanations and annotations."
-        )
-
-        llm_context_hints = []
-
-        if title_paragraph:
-            llm_context_hints.append(
-                f"The first title in the full text: {title_paragraph.unicode}"
-            )
-        if (
-            local_title_paragraph
-            and title_paragraph
-            and local_title_paragraph.debug_id != title_paragraph.debug_id
-        ):
-            llm_context_hints.append(
-                f"The most similar title in the full text: {local_title_paragraph.unicode}"
-            )
-
-        if translate_input and self.translation_config.add_formula_placehold_hint:
-            placeholders_hint = translate_input.get_placeholders_hint()
-            if placeholders_hint:
-                llm_context_hints.append(
-                    f"This is the formula placeholder hint: \n{placeholders_hint}"
-                )
-
-        active_glossary_markdown_blocks: list[str] = []
-        # Use cached glossaries
-        if self._cached_glossaries:
-            for glossary in self._cached_glossaries:
-                # Get active entries for the current text being processed (passed as 'text')
-                active_entries = glossary.get_active_entries_for_text(text)
-
-                if active_entries:
-                    current_glossary_md_entries: list[str] = []
-                    for original_source, target_text in sorted(active_entries):
-                        current_glossary_md_entries.append(
-                            f"| {original_source} | {target_text} |"
-                        )
-
-                    if current_glossary_md_entries:
-                        glossary_table_md = (
-                            f"### Glossary: {glossary.name}\n\n"
-                            "| Source Term | Target Term |\n"
-                            "|-------------|-------------|\n"
-                            + "\n".join(current_glossary_md_entries)
-                        )
-                        active_glossary_markdown_blocks.append(glossary_table_md)
-
-        if llm_context_hints or active_glossary_markdown_blocks:
-            llm_input.append(
-                "When translating, please refer to the following information to improve translation quality:"
-            )
-            current_hint_index = 1
-            for hint_line in llm_context_hints:
-                llm_input.append(f"{current_hint_index}. {hint_line}")
-                current_hint_index += 1
-
-            if active_glossary_markdown_blocks:
-                llm_input.append(
-                    f"{current_hint_index}. Strictly follow the glossary: use its target terms for all source terms (including variants), do not alter existing translations, and translate any unmatched terms naturally:"
-                )
-                current_hint_index += 1
-                for md_block in active_glossary_markdown_blocks:
-                    llm_input.append(f"\n{md_block}\n")
-
-        prompt_template = f"""
-Now, please carefully read the following text to be translated and directly output your translation.\n\n{text}
-"""
-        llm_input.append(prompt_template)
-
-        final_input = "\n".join(llm_input).strip()
-
-        return final_input
 
     def add_content_filter_hint(self, page: Page, paragraph: PdfParagraph):
         with self.add_content_filter_hint_lock:
