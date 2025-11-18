@@ -978,7 +978,7 @@ class ILTranslator:
 
             if active_glossary_markdown_blocks:
                 llm_input.append(
-                    f"{current_hint_index}. You MUST strictly adhere to the following glossaries. If a source term from a table appears in the text, use the corresponding target term in your translation:"
+                    f"{current_hint_index}. Strictly follow the glossary: use its target terms for all source terms (including variants), do not alter existing translations, and translate any unmatched terms naturally:"
                 )
                 current_hint_index += 1
                 for md_block in active_glossary_markdown_blocks:

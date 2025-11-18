@@ -765,7 +765,7 @@ class ILTranslatorLLMOnly:
 
                 if active_glossary_markdown_blocks:
                     llm_prompt_parts.append(
-                        f"{hint_idx}. You MUST strictly adhere to the following glossaries. please give preference to other glossaries. If a source term from a table appears in the text, use the corresponding target term in your translation:"
+                        f"{hint_idx}. Strictly follow the glossary: use its target terms for all source terms (including variants), do not alter existing translations, and translate any unmatched terms naturally:"
                     )
                     # hint_idx += 1 # No need to increment if tables are part of this point
                     for md_block in active_glossary_markdown_blocks:
