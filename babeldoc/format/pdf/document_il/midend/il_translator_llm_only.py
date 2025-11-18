@@ -70,17 +70,20 @@ For each item:
 
 ### Example
 Input:
-{
-  "id": 0,
-  "input": "{v1}<style id='2'>hello</style>, world!"
-  "layout_label": "text"
-}
-
+[
+    {
+    "id": 0,
+    "input": "{v1}<style id='2'>hello</style>, world!",
+    "layout_label": "text"
+    }
+]
 Output:
-{
-  "id": 0,
-  "output": "{v1}<style id='2'>你好</style>，世界！"
-}
+[
+    {
+    "id": 0,
+    "output": "{v1}<style id='2'>你好</style>，世界！"
+    }
+]
 
 $contextual_hints_block
 
