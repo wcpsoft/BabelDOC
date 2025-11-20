@@ -11,7 +11,7 @@ web/node_modules
 web/dist
 web/dist-ssr
 web/*.local
-
+*.lock
 memray*
 **/*.so
 *.pdf
