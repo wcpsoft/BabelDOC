@@ -5,6 +5,7 @@ import time
 import unicodedata
 from abc import ABC
 from abc import abstractmethod
+from collections import deque
 
 import httpx
 import openai
@@ -19,6 +20,90 @@ from babeldoc.translator.cache import TranslationCache
 from babeldoc.utils.atomic_integer import AtomicInteger
 
 logger = logging.getLogger(__name__)
+
+
+class ResponseTimeTracker:
+    """
+    跟踪API响应时间并提供动态超时建议
+    """
+    
+    def __init__(self, max_samples=50, base_timeout=60, max_timeout=300, safety_multiplier=2.5):
+        """
+        初始化响应时间跟踪器
+        
+        Args:
+            max_samples: 保留的最大样本数
+            base_timeout: 基础超时时间（秒）
+            max_timeout: 最大超时时间（秒）
+            safety_multiplier: 安全倍数，平均响应时间乘以此系数得到建议超时时间
+        """
+        self.max_samples = max_samples
+        self.base_timeout = base_timeout
+        self.max_timeout = max_timeout
+        self.safety_multiplier = safety_multiplier
+        self.response_times = deque(maxlen=max_samples)
+        self.lock = threading.Lock()
+        
+    def record_response_time(self, response_time):
+        """记录一次API响应时间"""
+        with self.lock:
+            self.response_times.append(response_time)
+    
+    def get_recommended_timeout(self):
+        """
+        根据历史响应时间获取建议的超时时间
+        
+        Returns:
+            建议的超时时间（秒）
+        """
+        with self.lock:
+            if not self.response_times:
+                return self.base_timeout
+                
+            # 计算平均响应时间
+            avg_response_time = sum(self.response_times) / len(self.response_times)
+            
+            # 计算标准差
+            variance = sum((x - avg_response_time) ** 2 for x in self.response_times) / len(self.response_times)
+            std_dev = variance ** 0.5
+            
+            # 使用平均值加上2倍标准差，再乘以安全系数
+            # 这样可以考虑到大多数正常情况下的响应时间波动
+            recommended_timeout = min(
+                self.max_timeout,
+                max(
+                    self.base_timeout,
+                    (avg_response_time + 2 * std_dev) * self.safety_multiplier
+                )
+            )
+            
+            return recommended_timeout
+    
+    def get_stats(self):
+        """获取响应时间统计信息"""
+        with self.lock:
+            if not self.response_times:
+                return {
+                    "count": 0,
+                    "avg": 0,
+                    "min": 0,
+                    "max": 0,
+                    "std_dev": 0,
+                    "recommended_timeout": self.base_timeout
+                }
+                
+            avg = sum(self.response_times) / len(self.response_times)
+            variance = sum((x - avg) ** 2 for x in self.response_times) / len(self.response_times)
+            std_dev = variance ** 0.5
+            
+            return {
+                "count": len(self.response_times),
+                "avg": avg,
+                "min": min(self.response_times),
+                "max": max(self.response_times),
+                "std_dev": std_dev,
+                "recommended_timeout": self.get_recommended_timeout()
+            }
 
 
 def remove_control_characters(s):
@@ -227,6 +312,7 @@ class OpenAITranslator(BaseTranslator):
         send_dashscope_header=False,
         send_temperature=True,
         reasoning=None,
+        enable_dynamic_timeout=True,
     ):
         super().__init__(lang_in, lang_out, ignore_cache)
         self.options = {"temperature": 0}  # 随机采样可能会打断公式标记
@@ -237,6 +323,15 @@ class OpenAITranslator(BaseTranslator):
         #     }
         #     self.add_cache_impact_parameters("reasoning-effort", 'minimal')
         self.reasoning = reasoning
+        
+        # 初始化响应时间跟踪器
+        self.enable_dynamic_timeout = enable_dynamic_timeout
+        self.response_time_tracker = ResponseTimeTracker() if enable_dynamic_timeout else None
+        
+        # 初始超时设置
+        self.base_timeout = 60  # 基础超时时间
+        self.max_timeout = 300  # 最大超时时间
+        
         self.client = openai.OpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -244,7 +339,7 @@ class OpenAITranslator(BaseTranslator):
                 limits=httpx.Limits(
                     max_connections=None, max_keepalive_connections=None
                 ),
-                timeout=180,  # Increased timeout to 180 seconds for better handling of large requests
+                timeout=self._get_current_timeout(),
             ),
         )
         if send_temperature:
@@ -266,16 +361,62 @@ class OpenAITranslator(BaseTranslator):
         self.prompt_token_count = AtomicInteger()
         self.completion_token_count = AtomicInteger()
         self.cache_hit_prompt_token_count = AtomicInteger()
+    
+    def _get_current_timeout(self):
+        """获取当前应该使用的超时时间"""
+        if self.enable_dynamic_timeout and self.response_time_tracker:
+            return self.response_time_tracker.get_recommended_timeout()
+        return self.base_timeout
+    
+    def _update_client_timeout(self):
+        """更新客户端的超时设置"""
+        if not self.enable_dynamic_timeout:
+            return
+            
+        current_timeout = self._get_current_timeout()
+        self.client = openai.OpenAI(
+            base_url=self.client.base_url,
+            api_key=self.client.api_key,
+            http_client=httpx.Client(
+                limits=httpx.Limits(
+                    max_connections=None, max_keepalive_connections=None
+                ),
+                timeout=current_timeout,
+            ),
+        )
+    
+    def _record_response_time(self, start_time):
+        """记录API响应时间"""
+        if self.enable_dynamic_timeout and self.response_time_tracker:
+            response_time = time.time() - start_time
+            self.response_time_tracker.record_response_time(response_time)
+            logger.debug(f"API响应时间: {response_time:.2f}秒, 建议超时: {self.response_time_tracker.get_recommended_timeout():.2f}秒")
+    
+    def get_timeout_stats(self):
+        """获取超时统计信息"""
+        if self.enable_dynamic_timeout and self.response_time_tracker:
+            return self.response_time_tracker.get_stats()
+        return {"dynamic_timeout": False}
 
     @retry(
-        retry=retry_if_exception_type(openai.RateLimitError),
-        stop=stop_after_attempt(100),
-        wait=wait_exponential(multiplier=1, min=1, max=15),
+        retry=(
+            retry_if_exception_type(openai.RateLimitError) |
+            retry_if_exception_type(openai.APITimeoutError) |
+            retry_if_exception_type(httpx.TimeoutException)
+        ),
+        stop=stop_after_attempt(5),  # Reduced from 100 to prevent excessive retries
+        wait=wait_exponential(multiplier=1, min=2, max=30),  # Increased min wait time
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def do_translate(self, text, rate_limit_params: dict = None) -> str:
         if text is None:
             return None
+            
+        # 更新客户端超时设置
+        self._update_client_timeout()
+        
+        # 记录请求开始时间
+        start_time = time.time()
             
         options = {}
         if self.send_temperature:
@@ -301,9 +442,17 @@ class OpenAITranslator(BaseTranslator):
                 return None
                 
             return content.strip()
+        except (openai.APITimeoutError, httpx.TimeoutException) as e:
+            logger.error(f"Request timed out in do_translate: {str(e)}")
+            # Return the original text as a fallback to maintain continuity
+            return text
         except Exception as e:
             logger.error(f"Unexpected error in do_translate: {str(e)}")
-            return None
+            # Return the original text as a fallback to maintain continuity
+            return text
+        finally:
+            # 记录响应时间
+            self._record_response_time(start_time)
 
     def prompt(self, text):
         return [
@@ -318,14 +467,24 @@ class OpenAITranslator(BaseTranslator):
         ]
 
     @retry(
-        retry=retry_if_exception_type(openai.RateLimitError),
-        stop=stop_after_attempt(100),
-        wait=wait_exponential(multiplier=1, min=1, max=15),
+        retry=(
+            retry_if_exception_type(openai.RateLimitError) |
+            retry_if_exception_type(openai.APITimeoutError) |
+            retry_if_exception_type(httpx.TimeoutException)
+        ),
+        stop=stop_after_attempt(5),  # Reduced from 100 to prevent excessive retries
+        wait=wait_exponential(multiplier=1, min=2, max=30),  # Increased min wait time
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def do_llm_translate(self, text, rate_limit_params: dict = None):
         if text is None:
             return None
+
+        # 更新客户端超时设置
+        self._update_client_timeout()
+        
+        # 记录请求开始时间
+        start_time = time.time()
 
         options = {}
         if self.send_temperature:
@@ -387,14 +546,17 @@ class OpenAITranslator(BaseTranslator):
                 raise ContentFilterError(e.message) from e
             else:
                 raise
-        except httpx.TimeoutException as e:
+        except (openai.APITimeoutError, httpx.TimeoutException) as e:
             logger.error(f"Request timed out in do_llm_translate: {str(e)}")
-            # Return a fallback response instead of None to prevent process interruption
-            return "[]"
+            # Return the original text as a fallback to maintain continuity
+            return text
         except Exception as e:
             logger.error(f"Unexpected error in do_llm_translate: {str(e)}")
-            # Return a fallback response instead of None to prevent process interruption
-            return "[]"
+            # Return the original text as a fallback to maintain continuity
+            return text
+        finally:
+            # 记录响应时间
+            self._record_response_time(start_time)
 
     def update_token_count(self, response):
         try:
