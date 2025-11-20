@@ -112,9 +112,14 @@ def indirect(obj):
 
 
 def get_glyph_cbox(face, g):
-    face.load_glyph(g, freetype.FT_LOAD_NO_SCALE)
-    cbox = face.glyph.outline.get_bbox()
-    return cbox.xMin, cbox.yMin, cbox.xMax, cbox.yMax
+    try:
+        face.load_glyph(g, freetype.FT_LOAD_NO_SCALE)
+        cbox = face.glyph.outline.get_bbox()
+        return cbox.xMin, cbox.yMin, cbox.xMax, cbox.yMax
+    except Exception as e:
+        # Return default bounding box when glyph loading fails
+        logger.warning("Failed to load glyph %d: %s", g, e)
+        return (0, 0, 1000, 1000)
 
 
 def get_char_cbox(face, idx):
@@ -126,8 +131,13 @@ def get_name_cbox(face, name):
     if name:
         if isinstance(name, str):
             name = name.encode("utf-8")
-        g = face.get_name_index(name)
-        return get_glyph_cbox(face, g)
+        try:
+            g = face.get_name_index(name)
+            return get_glyph_cbox(face, g)
+        except Exception as e:
+            # Return default bounding box when name index lookup fails
+            logger.warning("Failed to get name index for %s: %s", name, e)
+            return (0, 0, 1000, 1000)
     return (0, 0, 0, 0)
 
 
@@ -148,7 +158,7 @@ def parse_font_encoding(doc, idx):
 
 
 def get_truetype_ansi_bbox_list(face):
-    scale = 1000 / face.units_per_EM
+    scale = 1000 / face.units_per_EM if face.units_per_EM != 0 else 1.0
     bbox_list = [get_char_cbox(face, code) for code in WinAnsiEncoding]
     bbox_list = [[v * scale for v in bbox] for bbox in bbox_list]
     return bbox_list
@@ -157,23 +167,35 @@ def get_truetype_ansi_bbox_list(face):
 def collect_face_cmap(face):
     umap = []  # unicode maps
     lmap = []  # legacy maps
-    for cmap in face.charmaps:
-        if cmap.encoding_name == "FT_ENCODING_UNICODE":
-            umap.append(cmap)
-        else:
-            lmap.append(cmap)
+    try:
+        for cmap in face.charmaps:
+            if cmap.encoding_name == "FT_ENCODING_UNICODE":
+                umap.append(cmap)
+            else:
+                lmap.append(cmap)
+    except Exception as e:
+        logger.warning("Failed to collect face cmap: %s", e)
+        # Return empty maps when iteration fails
     return umap, lmap
 
 
 def get_truetype_custom_bbox_list(face):
     umap, lmap = collect_face_cmap(face)
     if umap:
-        face.set_charmap(umap[0])
+        try:
+            face.set_charmap(umap[0])
+        except Exception as e:
+            logger.warning("Failed to set unicode charmap: %s", e)
+            return []
     elif lmap:
-        face.set_charmap(lmap[0])
+        try:
+            face.set_charmap(lmap[0])
+        except Exception as e:
+            logger.warning("Failed to set legacy charmap: %s", e)
+            return []
     else:
         return []
-    scale = 1000 / face.units_per_EM
+    scale = 1000 / face.units_per_EM if face.units_per_EM != 0 else 1.0
     bbox_list = [get_char_cbox(face, code) for code in range(256)]
     bbox_list = [[v * scale for v in bbox] for bbox in bbox_list]
     return bbox_list
@@ -181,22 +203,39 @@ def get_truetype_custom_bbox_list(face):
 
 def parse_font_file(doc, idx, encoding, differences):
     bbox_list = []
-    data = doc.xref_stream(idx)
-    face = freetype.Face(BytesIO(data))
-    if face.get_format() == b"TrueType":
+    try:
+        data = doc.xref_stream(idx)
+        face = freetype.Face(BytesIO(data))
+    except Exception as e:
+        logger.error("Failed to create FreeType face for font idx %d: %s", idx, e)
+        # Return empty bbox list when face creation fails
+        return []
+    try:
+        font_format = face.get_format()
+    except Exception as e:
+        logger.warning("Failed to get font format for idx %d: %s", idx, e)
+        font_format = None
+    if font_format == b"TrueType":
         if encoding[0] == "WinAnsiEncoding":
             return get_truetype_ansi_bbox_list(face)
         elif encoding[0] == "Custom":
             return get_truetype_custom_bbox_list(face)
     glyph_name_set = set()
-    for x in range(0, face.num_glyphs):
-        glyph_name_set.add(face.get_glyph_name(x).decode("U8"))
-    scale = 1000 / face.units_per_EM
+    try:
+        for x in range(0, face.num_glyphs):
+            glyph_name_set.add(face.get_glyph_name(x).decode("U8"))
+    except Exception as e:
+        logger.warning("Failed to get glyph names for font idx %d: %s", idx, e)
+        # Continue with empty glyph name set
+    scale = 1000 / face.units_per_EM if face.units_per_EM != 0 else 1.0
     enc_name, enc_vector = encoding
     _, lmap = collect_face_cmap(face)
     abbr = enc_name.removesuffix("Encoding")
     if lmap and abbr in ["Custom", "MacRoman", "Standard", "WinAnsi", "MacExpert"]:
-        face.set_charmap(lmap[0])
+        try:
+            face.set_charmap(lmap[0])
+        except Exception as e:
+            logger.warning("Failed to set charmap %s for font idx %d: %s", abbr, idx, e)
     for i, x in enumerate(enc_vector):
         if x in glyph_name_set:
             v = get_name_cbox(face, x.encode("U8"))
