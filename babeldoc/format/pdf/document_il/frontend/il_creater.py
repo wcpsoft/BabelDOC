@@ -82,6 +82,157 @@ def batched(iterable, n, *, strict=False):
 
 logger = logging.getLogger(__name__)
 
+# Cache to track fonts that have known issues to avoid repeated processing
+PROBLEMATIC_FONTS = set()
+
+# Statistics for font repair attempts
+FONT_REPAIR_STATS = {
+    'total_attempts': 0,
+    'successful_repairs': 0,
+    'fallback_used': 0,
+    'base14_fallback_used': 0
+}
+
+
+def get_font_info(doc, idx):
+    """Get basic font information for logging purposes"""
+    try:
+        font_name = "Unknown"
+        base_font = doc.xref_get_key(idx, "BaseFont")
+        if base_font and base_font[0] == "name":
+            font_name = base_font[1]
+
+        font_type = "Unknown"
+        subtype = doc.xref_get_key(idx, "Subtype")
+        if subtype and subtype[0] == "name":
+            font_type = subtype[1]
+
+        return f"idx:{idx} name:{font_name} type:{font_type}"
+    except Exception:
+        return f"idx:{idx}"
+
+
+def repair_font_data(data):
+    """Attempt to repair corrupted font data"""
+    if not data or len(data) < 100:
+        return None
+
+    original_data = data
+
+    try:
+        # Try with original data first
+        freetype.Face(BytesIO(data))
+        return data
+    except Exception:
+        pass
+
+    # Attempt 1: Try different data sizes progressively
+    sizes_to_try = [
+        int(len(data) * 0.95),  # 95% of data
+        int(len(data) * 0.9),   # 90% of data
+        int(len(data) * 0.8),   # 80% of data
+        int(len(data) * 0.7),   # 70% of data
+        65536,                  # 64KB
+        32768,                  # 32KB
+        16384,                  # 16KB
+        8192,                   # 8KB
+    ]
+
+    for size in sizes_to_try:
+        if size >= len(data):
+            continue
+        try:
+            truncated_data = data[:size]
+            face = freetype.Face(BytesIO(truncated_data))
+            logger.debug("Successfully repaired font by using first %d bytes", size)
+            return truncated_data
+        except Exception:
+            continue
+
+    # Attempt 2: Try to find valid font table markers
+    if len(data) > 1000:
+        try:
+            # Look for 'glyf' table marker in TrueType fonts
+            glyf_pos = data.find(b'glyf')
+            if glyf_pos > 0:
+                # Try data up to glyf table
+                face = freetype.Face(BytesIO(data[:glyf_pos]))
+                logger.debug("Successfully repaired font by extracting up to glyf table")
+                return data[:glyf_pos]
+        except Exception:
+            pass
+
+    # Attempt 3: Try truncating corrupted data at the end more aggressively
+    for i in range(1, min(2000, len(data) // 5), 10):
+        try:
+            truncated_data = data[:-i]
+            if len(truncated_data) < 100:
+                break
+            freetype.Face(BytesIO(truncated_data))
+            logger.debug("Successfully repaired font by truncating %d bytes from end", i)
+            return truncated_data
+        except Exception:
+            continue
+
+    logger.debug("Could not repair font data after multiple attempts")
+    return None
+
+
+def get_fallback_bounding_box(font_info, encoding):
+    """Get fallback bounding box when font parsing fails"""
+    try:
+        # Try to use Base14 fonts as fallback
+        from babeldoc.format.pdf.babelpdf.base14 import get_base14_bbox
+
+        # Map common font names to Base14 equivalents
+        font_lower = font_info.lower()
+        if "helvetica" in font_lower or "arial" in font_lower:
+            FONT_REPAIR_STATS['base14_fallback_used'] += 1
+            return get_base14_bbox("Helvetica")
+        elif "times" in font_lower:
+            FONT_REPAIR_STATS['base14_fallback_used'] += 1
+            return get_base14_bbox("Times-Roman")
+        elif "courier" in font_lower:
+            FONT_REPAIR_STATS['base14_fallback_used'] += 1
+            return get_base14_bbox("Courier")
+        elif "symbol" in font_lower:
+            FONT_REPAIR_STATS['base14_fallback_used'] += 1
+            return get_base14_bbox("Symbol")
+        elif "zapfdingbats" in font_lower:
+            FONT_REPAIR_STATS['base14_fallback_used'] += 1
+            return get_base14_bbox("ZapfDingbats")
+
+        # Generic fallback based on font characteristics
+        if "sans" in font_lower or "arial" in font_lower:
+            return [(0, -100, 500, 600) for _ in range(256)]
+        elif "serif" in font_lower or "times" in font_lower:
+            return [(0, -200, 500, 700) for _ in range(256)]
+        elif "mono" in font_lower or "courier" in font_lower:
+            return [(0, -200, 600, 700) for _ in range(256)]
+        else:
+            # Most generic fallback - use Helvetica as default
+            FONT_REPAIR_STATS['base14_fallback_used'] += 1
+            return get_base14_bbox("Helvetica")
+    except Exception as e:
+        logger.debug("Base14 fallback failed for %s: %s, using generic fallback", font_info, e)
+        # Ultimate fallback
+        return [(0, 0, 500, 700) for _ in range(256)]
+
+
+def get_font_repair_stats():
+    """Get statistics about font repair attempts and success rates"""
+    total = FONT_REPAIR_STATS['total_attempts']
+    if total == 0:
+        return "No font repair attempts made"
+
+    success_rate = (FONT_REPAIR_STATS['successful_repairs'] / total) * 100
+    return (
+        f"Font Repair Statistics: "
+        f"{FONT_REPAIR_STATS['successful_repairs']}/{total} repairs successful ({success_rate:.1f}%), "
+        f"{FONT_REPAIR_STATS['fallback_used']} fallbacks used, "
+        f"{FONT_REPAIR_STATS['base14_fallback_used']} Base14 fallbacks used"
+    )
+
 #
 # def create_hook(func, hook):
 #     @wraps(func)
@@ -136,7 +287,7 @@ def get_name_cbox(face, name):
             return get_glyph_cbox(face, g)
         except Exception as e:
             # Return default bounding box when name index lookup fails
-            logger.warning("Failed to get name index for %s: %s", name, e)
+            logger.debug("Failed to get name index for %s: %s", name.decode("utf-8", errors="replace"), e)
             return (0, 0, 1000, 1000)
     return (0, 0, 0, 0)
 
@@ -185,13 +336,13 @@ def get_truetype_custom_bbox_list(face):
         try:
             face.set_charmap(umap[0])
         except Exception as e:
-            logger.warning("Failed to set unicode charmap: %s", e)
+            logger.warning("Failed to set unicode charmap for font: %s", e)
             return []
     elif lmap:
         try:
             face.set_charmap(lmap[0])
         except Exception as e:
-            logger.warning("Failed to set legacy charmap: %s", e)
+            logger.warning("Failed to set legacy charmap for font: %s", e)
             return []
     else:
         return []
@@ -203,17 +354,46 @@ def get_truetype_custom_bbox_list(face):
 
 def parse_font_file(doc, idx, encoding, differences):
     bbox_list = []
+
+    font_info = get_font_info(doc, idx)
+
+    # Skip if this font is known to have issues AND we've already tried repairing it
+    if idx in PROBLEMATIC_FONTS:
+        logger.debug("Skipping known problematic font %s, using fallback", font_info)
+        return get_fallback_bounding_box(font_info, encoding)
+
     try:
         data = doc.xref_stream(idx)
         face = freetype.Face(BytesIO(data))
     except Exception as e:
-        logger.error("Failed to create FreeType face for font idx %d: %s", idx, e)
-        # Return empty bbox list when face creation fails
-        return []
+        logger.warning("Failed to create FreeType face for font %s: %s", font_info, e)
+
+        # Try to repair the font data
+        FONT_REPAIR_STATS['total_attempts'] += 1
+        logger.info("Attempting to repair font %s (attempt %d)", font_info, FONT_REPAIR_STATS['total_attempts'])
+        try:
+            data = doc.xref_stream(idx)  # Get fresh data
+            repaired_data = repair_font_data(data)
+            if repaired_data:
+                face = freetype.Face(BytesIO(repaired_data))
+                FONT_REPAIR_STATS['successful_repairs'] += 1
+                logger.info("Successfully repaired font %s (%d/%d repairs successful)",
+                           font_info, FONT_REPAIR_STATS['successful_repairs'], FONT_REPAIR_STATS['total_attempts'])
+            else:
+                # Repair failed, use fallback
+                FONT_REPAIR_STATS['fallback_used'] += 1
+                logger.info("Font repair failed for %s, using fallback bounding boxes", font_info)
+                return get_fallback_bounding_box(font_info, encoding)
+        except Exception as repair_error:
+            FONT_REPAIR_STATS['fallback_used'] += 1
+            logger.error("Font repair failed for %s: %s", font_info, repair_error)
+            # Mark as problematic if repair failed catastrophically
+            PROBLEMATIC_FONTS.add(idx)
+            return get_fallback_bounding_box(font_info, encoding)
     try:
         font_format = face.get_format()
     except Exception as e:
-        logger.warning("Failed to get font format for idx %d: %s", idx, e)
+        logger.warning("Failed to get font format for font %s: %s", font_info, e)
         font_format = None
     if font_format == b"TrueType":
         if encoding[0] == "WinAnsiEncoding":
@@ -225,8 +405,15 @@ def parse_font_file(doc, idx, encoding, differences):
         for x in range(0, face.num_glyphs):
             glyph_name_set.add(face.get_glyph_name(x).decode("U8"))
     except Exception as e:
-        logger.warning("Failed to get glyph names for font idx %d: %s", idx, e)
-        # Continue with empty glyph name set
+        logger.warning("Failed to get glyph names for font %s: %s", font_info, e)
+        # Try to get at least some glyph names (first 100 glyphs)
+        try:
+            for x in range(0, min(100, face.num_glyphs)):
+                glyph_name_set.add(face.get_glyph_name(x).decode("U8"))
+            logger.info("Successfully retrieved %d glyph names for font %s", len(glyph_name_set), font_info)
+        except Exception as e2:
+            logger.warning("Even partial glyph name retrieval failed for font %s: %s", font_info, e2)
+            # Continue with empty glyph name set - we'll use character-based fallback
     scale = 1000 / face.units_per_EM if face.units_per_EM != 0 else 1.0
     enc_name, enc_vector = encoding
     _, lmap = collect_face_cmap(face)
@@ -235,18 +422,46 @@ def parse_font_file(doc, idx, encoding, differences):
         try:
             face.set_charmap(lmap[0])
         except Exception as e:
-            logger.warning("Failed to set charmap %s for font idx %d: %s", abbr, idx, e)
+            logger.warning("Failed to set charmap %s for font %s: %s", abbr, font_info, e)
+    successful_chars = 0
+    failed_chars = 0
+
     for i, x in enumerate(enc_vector):
-        if x in glyph_name_set:
-            v = get_name_cbox(face, x.encode("U8"))
-        else:
-            v = get_char_cbox(face, i)
-        bbox_list.append(v)
+        try:
+            if x in glyph_name_set:
+                v = get_name_cbox(face, x.encode("U8"))
+            else:
+                v = get_char_cbox(face, i)
+            bbox_list.append(v)
+            successful_chars += 1
+        except Exception as char_error:
+            # Use a default bounding box for this character
+            bbox_list.append((0, 0, 500, 700))
+            failed_chars += 1
+
     if differences:
         for code, name in differences:
-            bbox_list[code] = get_name_cbox(face, name.encode("U8"))
-    norm_bbox_list = [[v * scale for v in box] for box in bbox_list]
-    return norm_bbox_list
+            try:
+                bbox_list[code] = get_name_cbox(face, name.encode("U8"))
+            except Exception:
+                bbox_list[code] = (0, 0, 500, 700)
+
+    # Log success rate
+    total_chars = successful_chars + failed_chars
+    if total_chars > 0:
+        success_rate = successful_chars / total_chars
+        if success_rate < 0.5:  # If less than 50% of characters were processed successfully
+            logger.warning("Low success rate (%.1f%%) for font %s, using fallback", success_rate * 100, font_info)
+            return get_fallback_bounding_box(font_info, encoding)
+        elif failed_chars > 0:
+            logger.info("Font %s processed with %d/%d characters successfully", font_info, successful_chars, total_chars)
+
+    try:
+        norm_bbox_list = [[v * scale for v in box] for box in bbox_list]
+        return norm_bbox_list
+    except Exception as norm_error:
+        logger.warning("Failed to normalize bounding boxes for font %s: %s", font_info, norm_error)
+        return get_fallback_bounding_box(font_info, encoding)
 
 
 def parse_encoding(obj_str):
