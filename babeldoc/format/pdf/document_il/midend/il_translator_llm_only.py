@@ -42,8 +42,8 @@ PROMPT_TEMPLATE = Template(
 
 ## Structure Rules
 1. Keep **the same number of paragraphs as the input**.
-2. Input paragraphs may be **sliced pieces of the same original paragraph**.  
-   → You MUST treat each input paragraph **as an independent, fixed unit**.  
+2. Input paragraphs may be **sliced pieces of the same original paragraph**.
+   → You MUST treat each input paragraph **as an independent, fixed unit**.
    → Do NOT merge paragraphs, split paragraphs, or move content between paragraphs.
 3. Inside each paragraph, you may adjust word order for fluency, but:
    - Do NOT change the meaning.
@@ -51,18 +51,38 @@ PROMPT_TEMPLATE = Template(
 4. Translate ALL human-readable content into $lang_out.
 
 ## Do NOT Modify
-- Tags (e.g., <style>, <b>, <code>): keep them exactly the same.  
+- Tags (e.g., <style>, <b>, <code>): keep them exactly the same.
   *Translate tag-internal text except code blocks (<code>…</code>)*.
 - Placeholders: `{v1}`, `{name}`, `%s`, `%d`, `[[...]]`, `%%...%%` — keep exactly unchanged.
 - JSON keys or structure.
 
 $glossary_usage_rules_block
+## 🚨 CRITICAL OUTPUT REQUIREMENT 🚨
+**YOU MUST RETURN YOUR RESPONSE AS A VALID JSON ARRAY ONLY!**
+- **NO** explanatory text, **NO** introductions, **NO** comments
+- **NO** markdown code blocks (like \`\`\`json)
+- **START DIRECTLY WITH `[` AND END WITH `]`**
+- Your entire response must be **parseable JSON** and **nothing else**
+
 ## Output Format
-Return a JSON array of the same length.  
-For each item:
-- Keep the same "id" and remove other fields like "input" and "layout_label".
-- Add "output" with the translated text only.
-- No extra text, no ```json blocks.
+Return a JSON array of the same length with this exact structure:
+```json
+[
+    {
+        "id": 0,
+        "output": "translated text here"
+    },
+    {
+        "id": 1,
+        "output": "another translated text"
+    }
+]
+```
+**REQUIREMENTS:**
+- Keep the same "id" as input
+- Remove other fields like "input" and "layout_label"
+- Add "output" with the translated text only
+- **Your response must be ONLY the JSON array**
 
 ## Style
 - Produce fluent, professional $lang_out.
@@ -745,27 +765,65 @@ class ILTranslatorLLMOnly:
 
             llm_output = self._clean_json_output(llm_output)
 
-            # Try to parse JSON with error handling for incomplete JSON
+            # Try to parse JSON with enhanced error handling
             try:
                 parsed_output = json.loads(llm_output)
+                logger.debug(f"Successfully parsed JSON output with {len(parsed_output) if isinstance(parsed_output, list) else 1} items")
             except json.JSONDecodeError as e:
                 logger.warning(f"JSON decode error: {e}. Attempting to fix incomplete JSON.")
-                
-                # Try to fix common JSON issues
-                try:
-                    # If JSON is truncated, try to fix it
-                    if llm_output.count('{') > llm_output.count('}'):
-                        llm_output += '}' * (llm_output.count('{') - llm_output.count('}'))
-                    
-                    # If JSON has unclosed strings, try to fix them
-                    if llm_output.count('"') % 2 != 0:
-                        llm_output += '"'
-                    
-                    # Try parsing again
-                    parsed_output = json.loads(llm_output)
-                except json.JSONDecodeError as e2:
-                    logger.error(f"Failed to fix JSON: {e2}. Original error: {e}. Output: {llm_output[:200]}...")
-                    raise Exception(f"Invalid JSON output from translation: {e}")
+
+                # Check if the output contains prompt text instead of JSON
+                if any(indicator.lower() in llm_output.lower() for indicator in [
+                    "You are a professional", "Follow all rules", "Structure Rules"
+                ]):
+                    logger.error("LLM returned prompt instead of JSON output. This indicates a prompt formatting issue.")
+                    # Create a fallback response that preserves input
+                    parsed_output = []
+                    for item in json_format_input:
+                        parsed_output.append({
+                            "id": item["id"],
+                            "output": item["input"]  # Use original text as fallback
+                        })
+                    logger.info("Created fallback response preserving original text")
+                else:
+                    # Try to fix common JSON issues
+                    try:
+                        fixed_output = llm_output
+
+                        # If JSON is truncated, try to fix it
+                        if fixed_output.count('{') > fixed_output.count('}'):
+                            fixed_output += '}' * (fixed_output.count('{') - fixed_output.count('}'))
+
+                        # If JSON is an array and truncated, try to close it
+                        if fixed_output.startswith('[') and fixed_output.count('[') > fixed_output.count(']'):
+                            # Try to close the last object if it's incomplete
+                            if not fixed_output.rstrip().endswith('}') and not fixed_output.rstrip().endswith(']'):
+                                fixed_output = fixed_output.rstrip()
+                                if fixed_output.endswith(','):
+                                    fixed_output = fixed_output[:-1]
+                                if not fixed_output.endswith('}'):
+                                    fixed_output += '}'
+                            fixed_output += ']'
+
+                        # If JSON has unclosed strings, try to fix them
+                        if fixed_output.count('"') % 2 != 0:
+                            fixed_output += '"'
+
+                        # Try parsing again
+                        parsed_output = json.loads(fixed_output)
+                        logger.info(f"Successfully fixed and parsed JSON output")
+                    except json.JSONDecodeError as e2:
+                        logger.error(f"Failed to fix JSON: {e2}. Original error: {e}. Output preview: {llm_output[:300]}...")
+                        logger.error("This appears to be a prompt formatting or LLM configuration issue.")
+
+                        # Create a fallback response that preserves input
+                        parsed_output = []
+                        for item in json_format_input:
+                            parsed_output.append({
+                                "id": item["id"],
+                                "output": item["input"]  # Use original text as fallback
+                            })
+                        logger.info("Created emergency fallback response preserving original text")
 
             if isinstance(parsed_output, dict) and parsed_output.get(
                 "output", parsed_output.get("input", False)
@@ -1021,16 +1079,44 @@ class ILTranslatorLLMOnly:
         )
 
     def _clean_json_output(self, llm_output: str) -> str:
-        # Clean up JSON output by removing common wrapper tags
+        # Enhanced JSON output cleaning with better error detection
+        if not llm_output:
+            return ""
+
         llm_output = llm_output.strip()
-        if llm_output.startswith("<json>"):
-            llm_output = llm_output[6:]
-        if llm_output.endswith("</json>"):
-            llm_output = llm_output[:-7]
-        if llm_output.startswith("```json"):
-            llm_output = llm_output[7:]
-        if llm_output.startswith("```"):
-            llm_output = llm_output[3:]
-        if llm_output.endswith("```"):
-            llm_output = llm_output[:-3]
+
+        # Check if output looks like it contains the prompt instead of JSON
+        prompt_indicators = [
+            "You are a professional",
+            "Follow all rules strictly",
+            "## Structure Rules",
+            "## Output Format",
+            "## Example",
+            "Here is the input:",
+            "Now translate",
+            "Translate the following"
+        ]
+
+        for indicator in prompt_indicators:
+            if indicator.lower() in llm_output.lower():
+                logger.warning(f"LLM returned prompt text instead of JSON output: {llm_output[:100]}...")
+                return "[]"  # Return empty JSON array as fallback
+
+        # Remove common wrapper tags and prefixes
+        prefixes_to_remove = ["<json>", "```json", "```", "[", "{"]
+        suffixes_to_remove = ["</json>", "```", "]", "}"]
+
+        for prefix in prefixes_to_remove:
+            if llm_output.startswith(prefix):
+                llm_output = llm_output[len(prefix):].strip()
+
+        for suffix in suffixes_to_remove:
+            if llm_output.endswith(suffix):
+                llm_output = llm_output[:-len(suffix)].strip()
+
+        # If the output doesn't start with '[' or '{', it's likely not JSON
+        if llm_output and not (llm_output.startswith('[') or llm_output.startswith('{')):
+            logger.warning(f"LLM output doesn't start with JSON structure: {llm_output[:100]}...")
+            return "[]"  # Return empty JSON array as fallback
+
         return llm_output.strip()

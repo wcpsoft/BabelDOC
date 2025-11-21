@@ -98,21 +98,55 @@ FONT_REPAIR_STATS = {
 
 
 def get_font_info(doc, idx):
-    """Get basic font information for logging purposes"""
+    """Enhanced font information retrieval for logging and debugging"""
     try:
+        # Primary font name sources
         font_name = "Unknown"
         base_font = doc.xref_get_key(idx, "BaseFont")
         if base_font and base_font[0] == "name":
             font_name = base_font[1]
+        else:
+            # Try alternative font name sources
+            font_name_alt = doc.xref_get_key(idx, "FontName")
+            if font_name_alt and font_name_alt[0] == "name":
+                font_name = font_name_alt[1]
 
+        # Enhanced font type detection
         font_type = "Unknown"
         subtype = doc.xref_get_key(idx, "Subtype")
         if subtype and subtype[0] == "name":
             font_type = subtype[1]
+        else:
+            # Try to detect font type from other properties
+            font_file = doc.xref_get_key(idx, "FontDescriptor/FontFile")
+            if font_file and font_file[0] != "null":
+                font_type = "Type1"
+            else:
+                font_file2 = doc.xref_get_key(idx, "FontDescriptor/FontFile2")
+                if font_file2 and font_file2[0] != "null":
+                    font_type = "TrueType"
+                else:
+                    font_file3 = doc.xref_get_key(idx, "FontDescriptor/FontFile3")
+                    if font_file3 and font_file3[0] != "null":
+                        font_type = "CIDFontType0C"
 
-        return f"idx:{idx} name:{font_name} type:{font_type}"
-    except Exception:
-        return f"idx:{idx}"
+        # Get encoding information for better context
+        encoding = "Unknown"
+        encoding_info = doc.xref_get_key(idx, "Encoding")
+        if encoding_info and encoding_info[0] == "name":
+            encoding = encoding_info[1]
+
+        # Get font descriptor info if available
+        descriptor_info = ""
+        if doc.xref_get_key(idx, "FontDescriptor")[0] != "null":
+            flags = doc.xref_get_key(idx, "FontDescriptor/Flags")
+            if flags and flags[0] == "int":
+                descriptor_info = f" flags:{flags[1]}"
+
+        return f"idx:{idx} name:{font_name} type:{font_type} encoding:{encoding}{descriptor_info}"
+    except Exception as e:
+        logger.debug(f"Failed to get font info for idx {idx}: {e}")
+        return f"idx:{idx} name:Unknown type:Unknown"
 
 
 def repair_font_data(data):
@@ -432,74 +466,200 @@ def parse_font_file(doc, idx, encoding, differences):
 
     # Check if this font is known to have glyph name issues
     if idx in GLYPH_NAME_PROBLEMATIC_FONTS:
-        logger.debug("Font %s has known glyph name issues, skipping glyph name retrieval", font_info)
+        logger.debug("🔤 Font %s has known glyph name issues, skipping retrieval", font_info)
     else:
         total_glyphs = face.num_glyphs
         successful_glyphs = 0
         failed_glyphs = 0
-        max_attempts = min(total_glyphs, 500)  # Limit attempts to avoid excessive processing
 
-        # Try to get glyph names one by one to handle partial failures gracefully
-        for x in range(0, max_attempts):
+        # Smart attempt strategy based on font characteristics
+        if total_glyphs > 10000:
+            # Large font files - use sampling strategy
+            max_attempts = min(1000, total_glyphs // 10)
+            sample_strategy = "sampling"
+        elif total_glyphs > 1000:
+            # Medium font files - limit attempts but be comprehensive
+            max_attempts = min(500, total_glyphs)
+            sample_strategy = "limited"
+        else:
+            # Small font files - try all glyphs
+            max_attempts = total_glyphs
+            sample_strategy = "complete"
+
+        logger.debug(f"🔤 Processing font {font_info} with {total_glyphs} glyphs using {sample_strategy} strategy")
+
+        # Try to get glyph names with adaptive failure tolerance
+        consecutive_failures = 0
+        max_consecutive_failures = 20 if sample_strategy == "sampling" else 50
+        min_successful_threshold = 5 if sample_strategy == "sampling" else 10
+
+        for glyph_idx in range(0, max_attempts):
             try:
-                glyph_name = face.get_glyph_name(x).decode("U8")
+                glyph_name = face.get_glyph_name(glyph_idx).decode("U8")
                 glyph_name_set.add(glyph_name)
                 successful_glyphs += 1
+                consecutive_failures = 0  # Reset on success
+
+                # Early exit if we have enough glyph names for practical use
+                if successful_glyphs >= 200 and sample_strategy == "sampling":
+                    break
+
             except Exception as glyph_error:
                 failed_glyphs += 1
-                # If we're failing too many glyphs, break early
-                if failed_glyphs > 50 and successful_glyphs < 10:
-                    logger.warning("Too many glyph name failures for font %s (idx %d), stopping early", font_info, x)
+                consecutive_failures += 1
+
+                # Adaptive early stopping based on strategy
+                if (consecutive_failures > max_consecutive_failures and
+                    successful_glyphs < min_successful_threshold):
+                    logger.warning(
+                        f"🔤 Too many consecutive glyph name failures for font {font_info} "
+                        f"(idx {idx}), stopping early at glyph {glyph_idx}"
+                    )
+                    GLYPH_NAME_PROBLEMATIC_FONTS.add(idx)
+                    break
+
+                # For large fonts, be more aggressive with early stopping
+                if (sample_strategy == "sampling" and failed_glyphs > 100 and
+                    successful_glyphs < 20):
+                    logger.warning(
+                        f"🔤 Sampling strategy failed for font {font_info}, "
+                        f"marking as problematic early"
+                    )
                     GLYPH_NAME_PROBLEMATIC_FONTS.add(idx)
                     break
                 continue
 
-        # Log results
+        # Enhanced logging with better context
+        total_attempts = successful_glyphs + failed_glyphs
         if failed_glyphs == 0:
-            logger.debug("Successfully retrieved all %d glyph names for font %s", successful_glyphs, font_info)
+            logger.debug(
+                f"🔤 Successfully retrieved all {successful_glyphs} glyph names for font {font_info}"
+            )
         elif successful_glyphs == 0:
-            logger.warning("Failed to get any glyph names for font %s, marking as problematic", font_info)
+            logger.warning(
+                f"🚫 CRITICAL: Failed to get any glyph names for font {font_info}!\n"
+                f"   字体可能使用非标准的字形命名或已损坏\n"
+                f"   建议使用字符编码而非字形名称进行处理"
+            )
             GLYPH_NAME_PROBLEMATIC_FONTS.add(idx)
         else:
-            failure_rate = failed_glyphs / (successful_glyphs + failed_glyphs)
-            if failure_rate > 0.8:  # If more than 80% failed, mark as problematic
-                logger.warning("High glyph name failure rate (%.1f%%) for font %s, marking as problematic",
-                             failure_rate * 100, font_info)
+            failure_rate = failed_glyphs / total_attempts if total_attempts > 0 else 1.0
+
+            # Adaptive failure rate threshold based on strategy
+            failure_threshold = 0.9 if sample_strategy == "sampling" else 0.8
+
+            if failure_rate > failure_threshold:
+                logger.warning(
+                    f"⚠️  HIGH FAILURE RATE: {failure_rate*100:.1f}% glyph name failures for font {font_info}\n"
+                    f"   成功: {successful_glyphs}/{total_attempts}, 失败: {failed_glyphs}\n"
+                    f"   策略: {sample_strategy}, 阈值: {failure_threshold*100:.0f}%\n"
+                    f"   将标记为问题字体并使用备用处理方案"
+                )
                 GLYPH_NAME_PROBLEMATIC_FONTS.add(idx)
             else:
-                logger.info("Retrieved %d/%d glyph names for font %s (%d failed)",
-                           successful_glyphs, max_attempts, font_info, failed_glyphs)
+                logger.info(
+                    f"✅ Glyph name retrieval successful for font {font_info}:\n"
+                    f"   成功: {successful_glyphs}/{total_attempts} ({(1-failure_rate)*100:.1f}%), "
+                    f"失败: {failed_glyphs}, 策略: {sample_strategy}"
+                )
     scale = 1000 / face.units_per_EM if face.units_per_EM != 0 else 1.0
     enc_name, enc_vector = encoding
     _, lmap = collect_face_cmap(face)
     abbr = enc_name.removesuffix("Encoding")
+
+    # Enhanced charmap setting with better error handling
     if lmap and abbr in ["Custom", "MacRoman", "Standard", "WinAnsi", "MacExpert"]:
         try:
             face.set_charmap(lmap[0])
+            logger.debug(f"🔤 Successfully set charmap {abbr} for font {font_info}")
         except Exception as e:
-            logger.warning("Failed to set charmap %s for font %s: %s", abbr, font_info, e)
+            logger.warning(f"🔤 Failed to set charmap {abbr} for font {font_info}: {e}")
+
+    # Enhanced character processing with multiple fallback strategies
     successful_chars = 0
     failed_chars = 0
+    glyph_name_based_chars = 0
+    char_index_based_chars = 0
+    fallback_chars = 0
 
-    for i, x in enumerate(enc_vector):
+    # Determine the best strategy based on glyph name availability
+    use_glyph_names = len(glyph_name_set) > 10
+    if not use_glyph_names:
+        logger.info(f"🔤 Using character-index based strategy for font {font_info} (few glyph names available)")
+
+    for i, glyph_name in enumerate(enc_vector):
+        bbox = None
+        strategy_used = None
+
         try:
-            if x in glyph_name_set:
-                v = get_name_cbox(face, x.encode("U8"))
+            # Strategy 1: Use glyph names if available and sufficient
+            if use_glyph_names and glyph_name in glyph_name_set:
+                bbox = get_name_cbox(face, glyph_name.encode("U8"))
+                strategy_used = "glyph_name"
+                glyph_name_based_chars += 1
             else:
-                v = get_char_cbox(face, i)
-            bbox_list.append(v)
-            successful_chars += 1
+                # Strategy 2: Use character index (more reliable for many fonts)
+                bbox = get_char_cbox(face, i)
+                strategy_used = "char_index"
+                char_index_based_chars += 1
+
+            if bbox and bbox != (0, 0, 0, 0):  # Valid bounding box
+                bbox_list.append(bbox)
+                successful_chars += 1
+            else:
+                # Strategy 3: Use default bounding box
+                bbox_list.append((0, 0, 500, 700))
+                failed_chars += 1
+                strategy_used = "fallback"
+                fallback_chars += 1
+
         except Exception as char_error:
-            # Use a default bounding box for this character
+            # Final fallback: use default bounding box
             bbox_list.append((0, 0, 500, 700))
             failed_chars += 1
+            strategy_used = "error_fallback"
+            fallback_chars += 1
 
+            # Log detailed error for debugging (but not too many)
+            if failed_chars <= 5:
+                logger.debug(f"🔤 Character processing failed for font {font_info}, char {i} ('{glyph_name}'): {char_error}")
+
+    # Process differences with enhanced error handling
     if differences:
+        logger.debug(f"🔤 Processing {len(differences)} encoding differences for font {font_info}")
         for code, name in differences:
             try:
-                bbox_list[code] = get_name_cbox(face, name.encode("U8"))
-            except Exception:
+                if use_glyph_names and name in glyph_name_set:
+                    bbox = get_name_cbox(face, name.encode("U8"))
+                else:
+                    bbox = (0, 0, 500, 700)  # Default for differences when glyph names are unreliable
+                bbox_list[code] = bbox
+            except Exception as diff_error:
                 bbox_list[code] = (0, 0, 500, 700)
+                logger.debug(f"🔤 Difference processing failed for font {font_info}, code {code}, name '{name}': {diff_error}")
+
+    # Enhanced success rate logging
+    total_chars = successful_chars + failed_chars
+    if total_chars > 0:
+        success_rate = successful_chars / total_chars
+
+        # Provide detailed strategy breakdown
+        strategy_info = f"字形名:{glyph_name_based_chars}, 字符索引:{char_index_based_chars}, 备用:{fallback_chars}"
+
+        if success_rate < 0.5:  # If less than 50% of characters were processed successfully
+            logger.warning(
+                f"❌ LOW SUCCESS RATE: {success_rate*100:.1f}% for font {font_info}\n"
+                f"   策略分布: {strategy_info}\n"
+                f"   总计: {successful_chars}/{total_chars} 成功, {failed_chars} 失败\n"
+                f"   将使用备用边界框处理"
+            )
+            return get_fallback_bounding_box(font_info, encoding)
+        elif failed_chars > 0:
+            logger.info(
+                f"✅ Font {font_info} processed successfully:\n"
+                f"   成功率: {success_rate*100:.1f}% ({successful_chars}/{total_chars})\n"
+                f"   策略分布: {strategy_info}, 失败: {failed_chars}"
+            )
 
     # Log success rate
     total_chars = successful_chars + failed_chars
