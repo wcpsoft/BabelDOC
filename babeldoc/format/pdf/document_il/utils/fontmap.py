@@ -205,11 +205,36 @@ class FontMapper:
             if font.has_glyph(current_char):
                 return font
 
+        # 构建缺失字体提示信息
+        missing_font_info = {
+            'char_unicode': char_unicode,
+            'char_code': current_char,
+            'original_font_name': getattr(original_font, 'name', 'Unknown'),
+            'original_font_id': getattr(original_font, 'font_id', 'Unknown'),
+            'font_properties': {
+                'bold': bold if isinstance(original_font, PdfFont) else getattr(original_font, 'is_bold', False),
+                'italic': italic if isinstance(original_font, PdfFont) else getattr(original_font, 'is_italic', False),
+                'serif': serif if isinstance(original_font, PdfFont) else getattr(original_font, 'is_serif', False),
+                'monospace': monospaced if isinstance(original_font, PdfFont) else getattr(original_font, 'is_monospaced', False),
+            }
+        }
+
+        # 使用红色醒目提示缺失字体信息
         logger.warning(
-            f"Can't find font for {char_unicode}({current_char}). "
-            f"Original font: {original_font.name}[{original_font.font_id}]. "
-            f"Char unicode: {char_unicode}. ",
+            f"🚫 FONT MISSING: 无法为字符 '{char_unicode}' (Unicode: {current_char}) 找到合适的字体映射!\n"
+            f"   原始字体: {missing_font_info['original_font_name']} (ID: {missing_font_info['original_font_id']})\n"
+            f"   字体属性: 粗体={missing_font_info['font_properties']['bold']}, "
+            f"斜体={missing_font_info['font_properties']['italic']}, "
+            f"衬线={missing_font_info['font_properties']['serif']}, "
+            f"等宽={missing_font_info['font_properties']['monospace']}\n"
+            f"   建议检查: 字体库中是否包含支持该字符的字体"
         )
+
+        # 返回基础字体作为最后的备选方案
+        if hasattr(self, 'base_font') and self.base_font:
+            logger.info(f"使用基础字体 '{self.base_font.font_id}' 作为缺失字符的备选方案")
+            return self.base_font
+
         return None
 
     def get_used_font_ids(self, il: il_version_1.Document) -> set[str]:

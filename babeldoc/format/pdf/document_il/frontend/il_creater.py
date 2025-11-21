@@ -85,6 +85,9 @@ logger = logging.getLogger(__name__)
 # Cache to track fonts that have known issues to avoid repeated processing
 PROBLEMATIC_FONTS = set()
 
+# Cache to track fonts that have glyph name issues specifically
+GLYPH_NAME_PROBLEMATIC_FONTS = set()
+
 # Statistics for font repair attempts
 FONT_REPAIR_STATS = {
     'total_attempts': 0,
@@ -186,35 +189,47 @@ def get_fallback_bounding_box(font_info, encoding):
 
         # Map common font names to Base14 equivalents
         font_lower = font_info.lower()
+        fallback_font = None
+
         if "helvetica" in font_lower or "arial" in font_lower:
-            FONT_REPAIR_STATS['base14_fallback_used'] += 1
-            return get_base14_bbox("Helvetica")
+            fallback_font = "Helvetica"
         elif "times" in font_lower:
-            FONT_REPAIR_STATS['base14_fallback_used'] += 1
-            return get_base14_bbox("Times-Roman")
+            fallback_font = "Times-Roman"
         elif "courier" in font_lower:
-            FONT_REPAIR_STATS['base14_fallback_used'] += 1
-            return get_base14_bbox("Courier")
+            fallback_font = "Courier"
         elif "symbol" in font_lower:
-            FONT_REPAIR_STATS['base14_fallback_used'] += 1
-            return get_base14_bbox("Symbol")
+            fallback_font = "Symbol"
         elif "zapfdingbats" in font_lower:
+            fallback_font = "ZapfDingbats"
+
+        if fallback_font:
             FONT_REPAIR_STATS['base14_fallback_used'] += 1
-            return get_base14_bbox("ZapfDingbats")
+            logger.warning(
+                f"🔧 FONT REPAIR: 字体 '{font_info}' 解析失败，使用 Base14 备用字体 '{fallback_font}'"
+            )
+            return get_base14_bbox(fallback_font)
 
         # Generic fallback based on font characteristics
         if "sans" in font_lower or "arial" in font_lower:
+            logger.warning(f"🔧 FONT REPAIR: 字体 '{font_info}' 使用无衬线字体通用边界框")
             return [(0, -100, 500, 600) for _ in range(256)]
         elif "serif" in font_lower or "times" in font_lower:
+            logger.warning(f"🔧 FONT REPAIR: 字体 '{font_info}' 使用衬线字体通用边界框")
             return [(0, -200, 500, 700) for _ in range(256)]
         elif "mono" in font_lower or "courier" in font_lower:
+            logger.warning(f"🔧 FONT REPAIR: 字体 '{font_info}' 使用等宽字体通用边界框")
             return [(0, -200, 600, 700) for _ in range(256)]
         else:
             # Most generic fallback - use Helvetica as default
             FONT_REPAIR_STATS['base14_fallback_used'] += 1
+            logger.warning(
+                f"🔧 FONT REPAIR: 无法识别字体 '{font_info}' 类型，使用默认 Helvetica 边界框"
+            )
             return get_base14_bbox("Helvetica")
     except Exception as e:
-        logger.debug("Base14 fallback failed for %s: %s, using generic fallback", font_info, e)
+        logger.warning(
+            f"🔧 FONT REPAIR: Base14 备用字体也失败了 '{font_info}': {e}，使用最基础的边界框"
+        )
         # Ultimate fallback
         return [(0, 0, 500, 700) for _ in range(256)]
 
@@ -223,14 +238,16 @@ def get_font_repair_stats():
     """Get statistics about font repair attempts and success rates"""
     total = FONT_REPAIR_STATS['total_attempts']
     if total == 0:
-        return "No font repair attempts made"
+        return "📊 字体修复统计: 无修复尝试"
 
     success_rate = (FONT_REPAIR_STATS['successful_repairs'] / total) * 100
     return (
-        f"Font Repair Statistics: "
-        f"{FONT_REPAIR_STATS['successful_repairs']}/{total} repairs successful ({success_rate:.1f}%), "
-        f"{FONT_REPAIR_STATS['fallback_used']} fallbacks used, "
-        f"{FONT_REPAIR_STATS['base14_fallback_used']} Base14 fallbacks used"
+        f"📊 字体修复统计报告:\n"
+        f"   ✅ 成功修复: {FONT_REPAIR_STATS['successful_repairs']}/{total} ({success_rate:.1f}%)\n"
+        f"   🔧 使用备用方案: {FONT_REPAIR_STATS['fallback_used']} 次\n"
+        f"   📋 Base14 备用字体: {FONT_REPAIR_STATS['base14_fallback_used']} 次\n"
+        f"   🚫 问题字体缓存: {len(PROBLEMATIC_FONTS)} 个\n"
+        f"   🔤 字形名称问题: {len(GLYPH_NAME_PROBLEMATIC_FONTS)} 个"
     )
 
 #
@@ -366,27 +383,38 @@ def parse_font_file(doc, idx, encoding, differences):
         data = doc.xref_stream(idx)
         face = freetype.Face(BytesIO(data))
     except Exception as e:
-        logger.warning("Failed to create FreeType face for font %s: %s", font_info, e)
+        logger.error(
+            f"🚫 FONT ERROR: 无法创建 FreeType 字体对象 '{font_info}': {e}\n"
+            f"   这可能是由于字体文件损坏、格式不支持或文件不完整导致的"
+        )
 
         # Try to repair the font data
         FONT_REPAIR_STATS['total_attempts'] += 1
-        logger.info("Attempting to repair font %s (attempt %d)", font_info, FONT_REPAIR_STATS['total_attempts'])
+        logger.info(f"🔧 ATTEMPT: 尝试修复字体 '{font_info}' (第 {FONT_REPAIR_STATS['total_attempts']} 次尝试)")
         try:
             data = doc.xref_stream(idx)  # Get fresh data
             repaired_data = repair_font_data(data)
             if repaired_data:
                 face = freetype.Face(BytesIO(repaired_data))
                 FONT_REPAIR_STATS['successful_repairs'] += 1
-                logger.info("Successfully repaired font %s (%d/%d repairs successful)",
-                           font_info, FONT_REPAIR_STATS['successful_repairs'], FONT_REPAIR_STATS['total_attempts'])
+                logger.info(
+                    f"✅ FONT REPAIR: 成功修复字体 '{font_info}'!\n"
+                    f"   修复统计: {FONT_REPAIR_STATS['successful_repairs']}/{FONT_REPAIR_STATS['total_attempts']} 成功"
+                )
             else:
                 # Repair failed, use fallback
                 FONT_REPAIR_STATS['fallback_used'] += 1
-                logger.info("Font repair failed for %s, using fallback bounding boxes", font_info)
+                logger.warning(
+                    f"❌ FONT REPAIR: 字体 '{font_info}' 修复失败，使用备用边界框\n"
+                    f"   原因: 无法找到有效的字体数据片段"
+                )
                 return get_fallback_bounding_box(font_info, encoding)
         except Exception as repair_error:
             FONT_REPAIR_STATS['fallback_used'] += 1
-            logger.error("Font repair failed for %s: %s", font_info, repair_error)
+            logger.error(
+                f"💥 FONT REPAIR: 字体 '{font_info}' 修复过程中发生严重错误: {repair_error}\n"
+                f"   将标记为问题字体并使用备用方案"
+            )
             # Mark as problematic if repair failed catastrophically
             PROBLEMATIC_FONTS.add(idx)
             return get_fallback_bounding_box(font_info, encoding)
@@ -401,19 +429,46 @@ def parse_font_file(doc, idx, encoding, differences):
         elif encoding[0] == "Custom":
             return get_truetype_custom_bbox_list(face)
     glyph_name_set = set()
-    try:
-        for x in range(0, face.num_glyphs):
-            glyph_name_set.add(face.get_glyph_name(x).decode("U8"))
-    except Exception as e:
-        logger.warning("Failed to get glyph names for font %s: %s", font_info, e)
-        # Try to get at least some glyph names (first 100 glyphs)
-        try:
-            for x in range(0, min(100, face.num_glyphs)):
-                glyph_name_set.add(face.get_glyph_name(x).decode("U8"))
-            logger.info("Successfully retrieved %d glyph names for font %s", len(glyph_name_set), font_info)
-        except Exception as e2:
-            logger.warning("Even partial glyph name retrieval failed for font %s: %s", font_info, e2)
-            # Continue with empty glyph name set - we'll use character-based fallback
+
+    # Check if this font is known to have glyph name issues
+    if idx in GLYPH_NAME_PROBLEMATIC_FONTS:
+        logger.debug("Font %s has known glyph name issues, skipping glyph name retrieval", font_info)
+    else:
+        total_glyphs = face.num_glyphs
+        successful_glyphs = 0
+        failed_glyphs = 0
+        max_attempts = min(total_glyphs, 500)  # Limit attempts to avoid excessive processing
+
+        # Try to get glyph names one by one to handle partial failures gracefully
+        for x in range(0, max_attempts):
+            try:
+                glyph_name = face.get_glyph_name(x).decode("U8")
+                glyph_name_set.add(glyph_name)
+                successful_glyphs += 1
+            except Exception as glyph_error:
+                failed_glyphs += 1
+                # If we're failing too many glyphs, break early
+                if failed_glyphs > 50 and successful_glyphs < 10:
+                    logger.warning("Too many glyph name failures for font %s (idx %d), stopping early", font_info, x)
+                    GLYPH_NAME_PROBLEMATIC_FONTS.add(idx)
+                    break
+                continue
+
+        # Log results
+        if failed_glyphs == 0:
+            logger.debug("Successfully retrieved all %d glyph names for font %s", successful_glyphs, font_info)
+        elif successful_glyphs == 0:
+            logger.warning("Failed to get any glyph names for font %s, marking as problematic", font_info)
+            GLYPH_NAME_PROBLEMATIC_FONTS.add(idx)
+        else:
+            failure_rate = failed_glyphs / (successful_glyphs + failed_glyphs)
+            if failure_rate > 0.8:  # If more than 80% failed, mark as problematic
+                logger.warning("High glyph name failure rate (%.1f%%) for font %s, marking as problematic",
+                             failure_rate * 100, font_info)
+                GLYPH_NAME_PROBLEMATIC_FONTS.add(idx)
+            else:
+                logger.info("Retrieved %d/%d glyph names for font %s (%d failed)",
+                           successful_glyphs, max_attempts, font_info, failed_glyphs)
     scale = 1000 / face.units_per_EM if face.units_per_EM != 0 else 1.0
     enc_name, enc_vector = encoding
     _, lmap = collect_face_cmap(face)
