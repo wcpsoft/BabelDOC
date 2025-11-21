@@ -154,7 +154,7 @@ class RateLimiter:
             self.min_interval = 1.0 / max_qps
 
 
-_translate_rate_limiter = RateLimiter(5)
+_translate_rate_limiter = RateLimiter(2)  # Reduced from 5 to 2 to avoid TPM limits
 
 
 def set_translate_rate_limiter(max_qps):
@@ -222,6 +222,12 @@ class BaseTranslator(ABC):
                 logger.debug(f"try get cache failed, ignore it: {e}")
         _translate_rate_limiter.wait()
         translation = self.do_translate(text, rate_limit_params)
+
+        # Handle None return from do_translate (API errors)
+        if translation is None:
+            logger.warning(f"Translation failed for text, using original text as fallback")
+            translation = text  # Use original text as safe fallback
+
         if not (self.ignore_cache or ignore_cache) and translation is not None:
             try:
                 self.cache.set(text, translation)
@@ -251,6 +257,12 @@ class BaseTranslator(ABC):
                 logger.debug(f"try get cache failed, ignore it: {e}")
         _translate_rate_limiter.wait()
         translation = self.do_llm_translate(text, rate_limit_params)
+
+        # Handle None return from do_llm_translate (API errors)
+        if translation is None:
+            logger.warning(f"LLM translation failed for text, using original text as fallback")
+            translation = text  # Use original text as safe fallback
+
         if not (self.ignore_cache or ignore_cache) and translation is not None:
             try:
                 self.cache.set(text, translation)
@@ -405,7 +417,7 @@ class OpenAITranslator(BaseTranslator):
             retry_if_exception_type(httpx.TimeoutException)
         ),
         stop=stop_after_attempt(5),  # Reduced from 100 to prevent excessive retries
-        wait=wait_exponential(multiplier=1, min=2, max=30),  # Increased min wait time
+        wait=wait_exponential(multiplier=2, min=5, max=60),  # Increased wait time for rate limits
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def do_translate(self, text, rate_limit_params: dict = None) -> str:
@@ -447,9 +459,19 @@ class OpenAITranslator(BaseTranslator):
             # Return the original text as a fallback to maintain continuity
             return text
         except Exception as e:
-            logger.error(f"Unexpected error in do_translate: {str(e)}")
-            # Return the original text as a fallback to maintain continuity
-            return text
+            error_msg = str(e)
+            logger.error(f"Unexpected error in do_translate: {error_msg}")
+
+            # Check for rate limiting errors
+            if "429" in error_msg or "rate limiting" in error_msg.lower() or "TPM limit reached" in error_msg:
+                logger.warning("🚨 Rate limit detected (429 TPM error), implementing backoff strategy")
+                return None
+            elif "Not Found" in error_msg or "404" in error_msg:
+                logger.error("🚫 API endpoint not found (404 error), check API configuration")
+                return None
+            else:
+                logger.warning(f"⚠️ Other API error: {error_msg}, using fallback")
+                return None  # Don't return the prompt text anymore
         finally:
             # 记录响应时间
             self._record_response_time(start_time)
@@ -473,7 +495,7 @@ class OpenAITranslator(BaseTranslator):
             retry_if_exception_type(httpx.TimeoutException)
         ),
         stop=stop_after_attempt(5),  # Reduced from 100 to prevent excessive retries
-        wait=wait_exponential(multiplier=1, min=2, max=30),  # Increased min wait time
+        wait=wait_exponential(multiplier=2, min=5, max=60),  # Increased wait time for rate limits
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def do_llm_translate(self, text, rate_limit_params: dict = None):
@@ -551,9 +573,20 @@ class OpenAITranslator(BaseTranslator):
             # Return the original text as a fallback to maintain continuity
             return text
         except Exception as e:
-            logger.error(f"Unexpected error in do_llm_translate: {str(e)}")
-            # Return the original text as a fallback to maintain continuity
-            return text
+            error_msg = str(e)
+            logger.error(f"Unexpected error in do_llm_translate: {error_msg}")
+
+            # Check for rate limiting errors
+            if "429" in error_msg or "rate limiting" in error_msg.lower() or "TPM limit reached" in error_msg:
+                logger.warning("🚨 Rate limit detected (429 TPM error), implementing backoff strategy")
+                # For rate limit errors, return None to trigger fallback in caller
+                return None
+            elif "Not Found" in error_msg or "404" in error_msg:
+                logger.error("🚫 API endpoint not found (404 error), check API configuration")
+                return None
+            else:
+                logger.warning(f"⚠️ Other API error: {error_msg}, using fallback")
+                return None  # Don't return the prompt text anymore
         finally:
             # 记录响应时间
             self._record_response_time(start_time)
